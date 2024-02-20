@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import argparse
+
+from pypcode import Arch, Context, PcodePrettyPrinter
+
+parser = argparse.ArgumentParser(description="hex instruction to pcode")
+parser.add_argument("architecture")
+parser.add_argument("instruction", help="instruction in hex (no 0x prefix)")
+parser.add_argument(
+    "--reverse-input",
+    action=argparse.BooleanOptionalAction,
+    help="whether to reverse the hex input or not, enabled by default",
+    default=True,
+)
+args = parser.parse_args()
+
+short_arch_name_map = {
+    "aarch64": "AARCH64:LE:64:v8A",
+    "armv7": "ARM:LE:32:v7",
+    "riscv32": "RISCV:LE:32:RV32GC",
+    "riscv64": "RISCV:LE:64:RV64GC",
+    "x86": "x86:LE:32:default",
+    "x86-64": "x86:LE:64:default",
+}
+
+targets = {target.id: target for arch in Arch.enumerate() for target in arch.languages}
+if args.architecture in targets:
+    target = targets[args.architecture]
+elif args.architecture in short_arch_name_map:
+    target = targets[short_arch_name_map[args.architecture]]
+else:
+    raise SystemExit("Unrecognised architecture")
+
+ctx = Context(target)
+machine_code = bytearray.fromhex(args.instruction)
+if args.reverse_input:
+    machine_code.reverse()
+base_address = 0
+result = ctx.translate(machine_code, base_address, bb_terminating=True)
+if result.error:
+    raise SystemExit(
+        "P-code conversion failed (--reverse-input/--no-reverse-input needed?): "
+        + str(result.error)
+    )
+for insn in result.instructions:
+    print(f"-- {insn.address.offset:#x}: {insn.asm_mnem} {insn.asm_body}")
+    for op in insn.ops:
+        print(f"{op.seq.uniq}) {PcodePrettyPrinter.fmt_op(op)}")
