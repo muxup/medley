@@ -32,6 +32,10 @@ confirm the precise semantics of a given encoded instruction.
 This was written against pypcode 1.1.2 (as packaged for Arch at the time of
 writing), though the API seems like it may have changed a bit in 2.0.
 
+See the [accompanying blog
+post](https://muxup.com/2024q1/clarifying-instruction-semantics-with-p-code)
+for more information.
+
 ## License
 
 The [MIT license](https://github.com/muxup/medley/blob/main/LICENSE).
