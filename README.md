@@ -38,4 +38,4 @@ for more information.
 
 ## License
 
-The [MIT license](https://github.com/muxup/medley/blob/main/LICENSE).
+The [MIT-0 license](https://github.com/muxup/medley/blob/main/LICENSE).
