@@ -1,0 +1,140 @@
+#!/bin/sh
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+TARGET_DIR=""
+SUITE=""
+MIRROR=""
+ARGSTR=""
+
+error() {
+  printf "!!!!!!!!!! Error: %s !!!!!!!!!!\n" "$*" >&2
+  exit 1
+}
+
+usage_error() {
+  usage
+  error "$*"
+}
+
+error_if_whitespace() {
+  case "$1" in
+    *[[:space:]]*)
+      error "Rejecting '$1' - Arguments with whitespace are not supported"
+      ;;
+  esac
+}
+
+usage() {
+  echo "Usage: rootless-debootstrap-wrapper --target-dir TGT --suite SUITE [--mirror MIRROR] [--include INCLUDE] [...passthrough_opts]"
+}
+
+if [ $# -eq 0 ]; then
+  usage
+  exit
+fi
+
+while [ $# -gt 0 ]; do
+  error_if_whitespace "$1"
+  case "$1" in
+    --help|-h)
+      usage
+      exit
+      ;;
+    --include|--include=*)
+      if [ "$1" = "--include" ] && [ "$2" ]; then
+        error_if_whitespace "$2"
+        INCLUDE="$2,fakeroot"
+        shift
+      elif [ "${1#--include=}" != "$1" ]; then
+        INCLUDE="${1#--include=},fakeroot"
+      else
+        usage_error "Option --include requires an argument"
+      fi
+      ARGSTR="$ARGSTR --include=$INCLUDE"
+      ;;
+    --mirror|--mirror=*)
+      if [ "$1" = "--mirror" ] && [ "$2" ]; then
+        error_if_whitespace "$2"
+        MIRROR="$2"
+        shift
+      elif [ "${1#--mirror=}" != "$1" ]; then
+        MIRROR="${1#--mirror=}"
+      else
+        usage_error "Option --mirror requires an argument"
+      fi
+      ;;
+    --suite|--suite=*)
+      if [ "$1" = "--suite" ] && [ "$2" ]; then
+        error_if_whitespace "$2"
+        SUITE="$2"
+        shift
+      elif [ "${1#--suite=}" != "$1" ]; then
+        SUITE="${1#--suite=}"
+      else
+        usage_error "Option --suite requires an argument"
+      fi
+      ;;
+    --target-dir|--target-dir=*)
+      if [ "$1" = "--target-dir" ] && [ "$2" ]; then
+        error_if_whitespace "$2"
+        TARGET_DIR="$2"
+        shift
+      elif [ "${1#--target-dir=}" != "$1" ]; then
+        TARGET_DIR="${1#--target-dir=}"
+      else
+        usage_error "Option --target-dir requires an argument"
+      fi
+      ;;
+    *)
+      ARGSTR="$ARGSTR $1"
+      ;;
+  esac
+  shift
+done
+
+[ -n "$SUITE" ] || usag_error "Must set --suite"
+[ -n "$TARGET_DIR" ] || usage_error "Must set --target-dir"
+[ ! -e "$TARGET_DIR" ] || usge_error "Directory in --target-dir already exists, refusing to run"
+[ -z "$INCLUDE" ] && ARGSTR="$ARGSTR --include=fakeroot"
+
+ARGSTR="--foreign $ARGSTR $SUITE $TARGET_DIR"
+[ -n "$MIRROR" ] && ARGSTR="$ARGSTR $MIRROR"
+
+echo "@@@@@@@@@@ Starting first stage debootstrap @@@@@@@@@@"
+TMP_FAKEROOT_ENV=$(mktemp)
+fakeroot -s "$TMP_FAKEROOT_ENV" debootstrap $ARGSTR || error "Stage 1 debootstrap failed"
+mv "$TMP_FAKEROOT_ENV" "$TARGET_DIR/.fakeroot.env"
+
+echo "@@@@@@@@@@ Extracting fakeroot for target @@@@@@@@@@"
+cd "$TARGET_DIR" || error "cd failed"
+fakeroot -i .fakeroot.env -s .fakeroot.env bash -e <<'EOF' || error "Failed to extract fakeroot for target"
+for deb in ./var/cache/apt/archives/{libfakeroot_,fakeroot_}*.deb; do
+  tarball_ext=$(ar t $deb | sed -n '/^data\.tar\.[^.]*$/s/.*\.//p')
+  case "$tarball_ext" in
+    gz) decomp_flag=--gzip  ;;
+    xz) decomp_flag=--xz    ;;
+    zst) decomp_flag=--zstd ;;
+    *) echo "Unknown extension for tarball $tarball"; exit 1 ;;
+  esac
+  ar p "$deb" "data.tar.$tarball_ext" | tar x $decomp_flag
+done
+ln -s fakeroot-sysv ./usr/bin/fakeroot
+EOF
+cd "$OLDPWD" || error "cd failed"
+
+cat <<'EOF' > "$TARGET_DIR/_enter"
+#!/bin/sh
+export PATH=/usr/sbin:$PATH
+FAKEROOTDONTTRYCHOWN=1 unshare -fpr --mount-proc -R "$(dirname -- "$0")" \
+  fakeroot -i .fakeroot.env -s .fakeroot.env "$@"
+EOF
+chmod +x "$TARGET_DIR/_enter"
+
+echo "@@@@@@@@@@ Starting second stage debootstrap @@@@@@@@@@"
+"$TARGET_DIR/_enter" debootstrap/debootstrap --second-stage --keep-debootstrap-dir || error "Stage 2 debootstrap failed"
+mv "$TARGET_DIR/debootstrap/debootstrap.log" "$TARGET_DIR/_debootstrap.log"
+rm -rf "$TARGET_DIR/debootstrap"
+echo "@@@@@@@@@@ Debootstrap complete! @@@@@@@@@@"

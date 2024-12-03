@@ -36,6 +36,41 @@ See the [accompanying blog
 post](https://muxup.com/2024q1/clarifying-instruction-semantics-with-p-code)
 for more information.
 
+## rootless-debootstrap-wrapper
+
+Uses `fakeroot` and user namespaces to provide rootless cross-architecture debootstrap.
+
+A "hello world" usage example (assuming debootstrap, qemu-user-static, and
+qemu-user-static-binfmt are already installed):
+
+```sh
+./rootless-debootstrap-wrapper \
+  --arch=riscv64 \
+  --suite=sid \
+  --cache-dir="$HOME/debcache" \
+  --target-dir=hello-sid-riscv64 \
+  --include=build-essential
+cat <<EOF > hello-sid-riscv64/hello.c
+#include <stdio.h>
+#include <sys/utsname.h>
+
+int main() {
+  struct utsname buffer;
+  if (uname(&buffer) != 0) {
+      perror("uname");
+      return 1;
+    }
+  printf("Hello from %s\n", buffer.machine);
+  return 0;
+}
+EOF
+./hello-sid-riscv64/_enter sh -c "gcc hello.c && ./a.out"
+```
+
+See the [accompanying blog
+post](https://muxup.com/2024q4/rootless-cross-architecture-debootstrap) for
+more information.
+
 ## License
 
 The [MIT-0 license](https://github.com/muxup/medley/blob/main/LICENSE).
