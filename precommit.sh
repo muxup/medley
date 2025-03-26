@@ -5,7 +5,7 @@ die () {
   exit 1
 }
 
-PY_FILES="instruction_to_pcode"
+PY_FILES="instruction_to_pcode rvstat"
 
 isort --profile black -c $PY_FILES || die "isort failed"
 black --check $PY_FILES || die "black reports a .py needs reformatting"

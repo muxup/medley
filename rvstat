@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+import argparse
+import fnmatch
+import pathlib
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
+
+
+@dataclass
+class MIInfo:
+    pc: int
+    mnemonic: str
+    operands: str
+    width: int
+
+
+@dataclass
+class TBInfo:
+    pc: int
+    tcount: int
+    icount: int
+    ecount: int
+    fn_name: str
+    loc_desc: str
+    insts: list[MIInfo]
+
+
+tbs = {}
+
+
+class StatParseState(Enum):
+    SEEKING_HEADER_1 = 1
+    SEEKING_HEADER_2 = 2
+    PARSING_ENTRIES = 3
+
+
+def parse_qemu_out(log_path):
+    # Parse information from log. It's possible that the expected log output is
+    # interspersed with other output (e.g. other stderr output from the program,
+    # or output from other qemu plugins). So adopt a resilient parsing approach.
+    total_execed_instcount = 0
+    with log_path.open() as file:
+        current_state = StatParseState.SEEKING_HEADER_1
+        expected_max_entries = (2**64) - 1
+        for line in file:
+            if current_state == StatParseState.SEEKING_HEADER_1:
+                match = re.match(
+                    r"^collected (\d+) entries in the hash table \(showing up to (\d+)\)",
+                    line,
+                )
+                if not match:
+                    continue
+                if match.group(2) != str(expected_max_entries):
+                    print(
+                        "Warning: there was a limit on the number of collected hot blocks",
+                        file=sys.stderr,
+                    )
+                current_state = StatParseState.SEEKING_HEADER_2
+            elif current_state == StatParseState.SEEKING_HEADER_2:
+                if line != "pc, tcount, icount, ecount\n":
+                    continue
+                current_state = StatParseState.PARSING_ENTRIES
+            else:
+                try:
+                    pc, tcount, icount, ecount = line.strip("\n").split(", ")
+                    pc, tcount, icount, ecount = (
+                        int(pc, 16),
+                        int(tcount),
+                        int(icount),
+                        int(ecount),
+                    )
+                except ValueError:
+                    continue
+
+                total_execed_instcount += icount * ecount
+                if pc in tbs:
+                    tbs[pc].tcount += tcount
+                    tbs[pc].ecount += ecount
+                    if tbs[pc].icount != icount:
+                        print(
+                            f"Warning: mismatched icount. {icount} for {pc} from {log_path} doesnt equal previously read icount {tbs[pc].icount}"
+                        )
+                else:
+                    tbs[pc] = TBInfo(pc, tcount, icount, ecount, "", "", [])
+
+    print(
+        f"Collected information from {log_path} on {len(tbs)} TBs, and {total_execed_instcount} dynamically executed instructions"
+    )
+    return total_execed_instcount
+
+
+disasm_map = {}
+
+
+def process_bin_with_objdump(bin_path):
+    process = subprocess.Popen(
+        ["llvm-objdump", "-d", "--section=.text", bin_path],
+        stdout=subprocess.PIPE,
+        stderr=None,
+        text=True,
+        bufsize=1,
+    )
+
+    # One subtlety in the below code is that translation blocks (TBs) may overlap,
+    # meaning we need to keep track of which TBs we are currently in to ensure
+    # instructions are added to all of them.
+
+    cur_fn = None
+    cur_fn_addr = None
+    active_tbs = []
+    remaining_insts_in_cur_tb = 0
+    symbol_def_re = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:$")
+    insn_re = re.compile(r"^\s*([0-9a-f]+):\s+([0-9a-f]+)\s+([\w.]+)(?:\s+(.+))?$")
+
+    for line in process.stdout:
+        if match := symbol_def_re.match(line):
+            cur_fn_addr, cur_fn = match.groups()
+            cur_fn_addr = int(cur_fn_addr, 16)
+        elif match := insn_re.match(line):
+            addr, enc, mnemonic, operands = match.groups()
+            if cur_fn == None:
+                raise SystemExit(
+                    f"Encountered instruction at {addr:x} outside of any function"
+                )
+            addr = int(addr, 16)
+            cur_insn = MIInfo(addr, mnemonic, operands, len(enc) >> 1)
+            disasm_map[addr] = cur_insn
+            if addr in tbs:
+                offset_in_fn = addr - cur_fn_addr
+                tbs[addr].loc_desc = (
+                    f"<{cur_fn}+{offset_in_fn:x}>" if offset_in_fn else f"<{cur_fn}>"
+                )
+                tbs[addr].fn_name = cur_fn
+                new_tb = tbs[addr]
+                active_tbs.append((new_tb, new_tb.icount))
+
+            # Process the instruction for all active translation blocks
+            for i, (tb_info, remaining) in enumerate(active_tbs):
+                if remaining > 0:
+                    tb_info.insts.append(cur_insn)
+                    active_tbs[i] = (tb_info, remaining - 1)
+            # Filter out completed TBs with a list comprehension
+            active_tbs = [
+                (tb_info, remaining)
+                for tb_info, remaining in active_tbs
+                if remaining > 0
+            ]
+        elif line == "\n":
+            continue
+        elif "file format elf" in line:
+            continue
+        elif line == "Disassembly of section .text:\n":
+            continue
+        else:
+            print(f"!!!!! skipping '{line}'")
+
+    returncode = process.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, process.args)
+
+
+def analysis_dump(tb_list, total_exec_inst_count):
+    tb_count = len(tb_list)
+    cur_tb_num = 1
+    for tb in tb_list:
+        print(
+            f"TB {cur_tb_num}/{tb_count}: {hex(tb.pc)} {tb.loc_desc} ({tb.icount} insts executed {tb.ecount} times)"
+        )
+        for inst in tb.insts:
+            print(f"{hex(inst.pc)}: {inst.mnemonic} {inst.operands}")
+        print()
+        cur_tb_num += 1
+
+
+def analysis_exec(tb_list, total_execed_inst_count):
+    tb_list_execed_inst_count = 0
+    for tb in tb_list:
+        tb_list_execed_inst_count += tb.icount * tb.ecount
+    pct_tb_list_execed_insts = (
+        tb_list_execed_inst_count / total_execed_inst_count
+    ) * 100
+    print(
+        f"{pct_tb_list_execed_insts:.2f}% of execed instructions ({tb_list_execed_inst_count}/{total_execed_inst_count})"
+    )
+
+
+def analysis_mnemonic(tb_list, total_exec_inst_count):
+    histogram = {}
+    for tb in tb_list:
+        for inst in tb.insts:
+            if inst.mnemonic in histogram:
+                histogram[inst.mnemonic] += 1 * tb.ecount
+            else:
+                histogram[inst.mnemonic] = 1 * tb.ecount
+    sorted_histogram = dict(sorted(histogram.items(), key=lambda x: x[1], reverse=True))
+    for k, v in sorted_histogram.items():
+        print(k, v)
+
+
+def analysis_badinsn(tb_list, total_exec_inst_count):
+    for tb in tb_list:
+        for inst in tb.insts:
+            if inst.mnemonic == "mv" or inst.mnemonic.startswith("fmv"):
+                ops = inst.operands.split(",")
+                if len(ops) >= 2 and ops[0] == ops[1]:
+                    print(
+                        "Found redundant mv in {tb.fn_name}: {inst.pc:x} {inst.mnemonic} {inst.operands} (execed {tb.icount} times)"
+                    )
+
+
+def analysis_itype(tb_list, total_exec_inst_count):
+    # TODO: analysis for vector, conditional move, FP
+    execed_branch = 0
+    branch_mnemonics = {
+        "beq",
+        "bne",
+        "blt",
+        "bge",
+        "bltu",
+        "bgeu",
+        "beqz",
+        "bnez",
+        "blez",
+        "bgez",
+        "bltz",
+        "bgtz",
+        "jal",
+        "call",
+        "ret",
+        "j",
+    }
+    execed_mem = 0
+    mem_mnemonics = {
+        "lb",
+        "lh",
+        "lw",
+        "ld",
+        "flw",
+        "fld",
+        "sb",
+        "sh",
+        "sw",
+        "sd",
+        "fsw",
+        "fsd",
+    }
+    execed_other = 0
+    execed_compressed = 0
+    execed_noncompressed = 0
+    execed_total = 0
+    execed_imov = 0
+    execed_fmov = 0
+    execed_stackloads = 0
+    execed_stackstores = 0
+    for tb in tb_list:
+        for inst in tb.insts:
+            if inst.mnemonic in branch_mnemonics:
+                execed_branch += tb.ecount
+            elif inst.mnemonic in mem_mnemonics:
+                execed_mem += tb.ecount
+                if "(sp)" in inst.operands:
+                    if "l" in inst.mnemonic:
+                        execed_stackloads += tb.ecount
+                    else:
+                        execed_stackstores += tb.ecount
+            else:
+                execed_other += tb.ecount
+            if inst.width == 2:
+                execed_compressed += tb.ecount
+            else:
+                execed_noncompressed += tb.ecount
+            if inst.mnemonic == "mv":
+                execed_imov += tb.ecount
+            elif inst.mnemonic.startswith("fmv"):
+                execed_fmov += tb.ecount
+            execed_total += tb.ecount
+
+    def pct(v):
+        return v / execed_total * 100
+
+    print(
+        f"Breakdown: Mem {pct(execed_mem):.2f}% / Branch {pct(execed_branch):.2f}% / Other {pct(execed_other):.2f}%"
+    )
+    print(
+        f"Breakdown: Compressed {pct(execed_compressed):.2f}% / Noncompressed {pct(execed_noncompressed):.2f}%"
+    )
+    print(
+        f"Breakdown: Integer moves {pct(execed_imov):.2f}% / FP mov or convert {pct(execed_fmov):.2f}%"
+    )
+    print(
+        f"Breakdown: Stack loads {pct(execed_stackloads):.2f}% / Stack stores {pct(execed_stackstores):.2f}%"
+    )
+
+
+analyses_map = {
+    "badinsn": analysis_badinsn,
+    "dump": analysis_dump,
+    "exec": analysis_exec,
+    "mnemonic": analysis_mnemonic,
+    "itype": analysis_itype,
+}
+analyses_desc = {
+    "badinsn": "Redundant moves",
+    "dump": "Dumping instructions",
+    "exec": "Execution stats",
+    "mnemonic": "Histogram of mnemonics",
+    "itype": "Instruction type breakdown",
+}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="instruction stats from qemu log")
+    parser.add_argument("binary")
+    parser.add_argument(
+        "--whole",
+        type=str,
+        help="List of analyses to report on a whole filtered input basis, separated by commas",
+    )
+    parser.add_argument(
+        "--per-tb",
+        type=str,
+        help="List of analyses to report on per-TB of filtered input basis, separated by commas",
+    )
+    parser.add_argument(
+        "--per-fn",
+        type=str,
+        help="List of analyses to report on per-function of filtered input basis, separated by commas",
+    )
+    parser.add_argument("--filter", action="append", help="Filter to be applied")
+    # TODO: add help that lists the supported analyses and filters
+
+    args = parser.parse_args()
+    bin_path = pathlib.Path(args.binary)
+    bin_dir = bin_path.parent
+    if bin_dir == pathlib.Path():
+        bin_dir = pathlib.Path(".")
+    log_paths = bin_dir.glob(f"{bin_path.name}.qemu_out*")
+
+    if not bin_path.exists():
+        raise SystemExit("Can't find binary")
+    if not log_paths:
+        raise SystemExit("Can't find any .qemu_out")
+
+    def parse_analyses_arg(argval):
+        if not argval:
+            return []
+        requested_anas = argval.split(",")
+        for ana in requested_anas:
+            if not ana in analyses_map:
+                raise SystemExit("Unrecognised analysis")
+        return requested_anas
+
+    whole_analyses = parse_analyses_arg(args.whole)
+    pertb_analyses = parse_analyses_arg(args.per_tb)
+    perfn_analyses = parse_analyses_arg(args.per_fn)
+
+    total_execed_instcount = 0
+    for log_path in log_paths:
+        total_execed_instcount += parse_qemu_out(log_path)
+    process_bin_with_objdump(bin_path)
+
+    filtered_tb_list = list(tbs.values())
+
+    # Apply filters. Note these aren't implemented as reusable functions
+    # because most scripted filtering can easily be done with filter and a
+    # lambda.
+    filters = args.filter or []
+    if len(filters) == 0:
+        print(f"Applied no filters to the {len(tbs)} input TBs")
+    for filt in filters:
+        old_len = len(filtered_tb_list)
+        if filt.startswith("toptbs:"):
+            n = int(filt[len("toptbs:") :])
+            if n <= 0:
+                raise SystemExit("Illegal toptbs filter value")
+            filtered_tb_list = filtered_tb_list[:n]
+        elif filt.startswith("fn:"):
+            fn_names = filt[len("fn:") :].split(",")
+            new_filtered_tb_list = []
+            for tb in filtered_tb_list:
+                if not tb.fn_name:
+                    continue
+                for fn_name in fn_names:
+                    if fnmatch.fnmatch(tb.fn_name, fn_name):
+                        new_filtered_tb_list.append(tb)
+                        continue
+            filtered_tb_list = new_filtered_tb_list
+        elif filt.startswith("tb:"):
+            tb_addrs = filt[len("tb:") :].split(",")
+            new_filtered_tb_list = []
+            for tb in filtered_tb_list:
+                for tb_addr in tb_addrs:
+                    if "-" in tb_addr:
+                        low_pc, high_pc = tb_addr.split("-")
+                        if tb.pc >= int(low_pc, 16) and tb.pc <= int(high_pc, 16):
+                            new_filtered_tb_list.append(tb)
+                    elif tb.pc == int(tb_addr, 16):
+                        new_filtered_tb_list.append(tb)
+            filtered_tb_list = new_filtered_tb_list
+        else:
+            raise SystemExit("Unrecognised filter")
+        print(
+            f"Applied {filt} filter, reducing TBs from {old_len} to {len(filtered_tb_list)}"
+        )
+
+    # Perform analysis
+    for tb in filtered_tb_list:
+        for ana in pertb_analyses:
+            print(f"{analyses_desc[ana]} for TB at {hex(tb.pc)} {tb.loc_desc}")
+            analyses_map[ana]([tb], total_execed_instcount)
+            print()
+
+    tbs_by_fn = defaultdict(list)
+    for tb in filtered_tb_list:
+        if not tb.loc_desc:
+            continue
+        tb_fn_name = tb.loc_desc.strip("<>").split("+")[0]
+        tbs_by_fn[tb_fn_name].append(tb)
+    for k, v in tbs_by_fn.items():
+        for ana in perfn_analyses:
+            print(f"{analyses_desc[ana]} for function {k}:")
+            analyses_map[ana](v, total_execed_instcount)
+            print()
+
+    for ana in whole_analyses:
+        print(f"{analyses_desc[ana]} for all filtered input:")
+        analyses_map[ana](filtered_tb_list, total_execed_instcount)
+        print()
