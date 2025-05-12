@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import textwrap
+from collections import deque
+
+
+# Taken from <https://github.com/muxup/muxup-site/blob/main/gen>.
+def compile_template(template_str):
+    out = []
+    indent = 0
+    stack = []
+
+    def emit_line(line: str) -> None:
+        out.append(f"{'    ' * indent}{line}")
+
+    emit_line("def _render():")
+    indent += 1
+    emit_line("out = []")
+
+    for line_no, line in enumerate(template_str.splitlines(), start=1):
+        if line.startswith("$"):
+            pycmd = line[1:].strip()
+            keyword = pycmd.partition(" ")[0]
+            if keyword == "if":
+                stack.append(keyword)
+                emit_line(f"{pycmd}:")
+                indent += 1
+            elif keyword == "for":
+                stack.append(keyword)
+                emit_line(f"{pycmd}:")
+                indent += 1
+            elif keyword in ("elif", "else"):
+                if stack[-1] != "if":
+                    raise ValueError(f"Line {line_no}: Incorrectly nested '{keyword}'")
+                indent -= 1
+                emit_line(f"{pycmd}:")
+                indent += 1
+            elif keyword in ("endif", "endfor"):
+                expected = stack.pop()
+                if expected != keyword[3:]:
+                    raise ValueError(
+                        f"Line {line_no}: Expected end{expected}, got {pycmd}"
+                    )
+                if pycmd != keyword:
+                    raise ValueError(f"Line {line_no}: Unexpected text after {keyword}")
+                indent -= 1
+            else:
+                emit_line(f"{pycmd}")
+            continue
+
+        pos = 0
+        while pos <= len(line):
+            expr_start = line.find("{{", pos)
+            if expr_start == -1:
+                emit_line(f"out.append({repr(line[pos:])} '\\n')")
+                break
+            if expr_start != pos:
+                emit_line(f"out.append({repr(line[pos:expr_start])})")
+            expr_end = line.find("}}", expr_start)
+            if expr_end == -1:
+                raise ValueError(f"Line {line_no}: Couldn't find matching }}")
+            emit_line(f"out.append(str({line[expr_start + 2 : expr_end]}))")
+            pos = expr_end + 2
+    if len(stack) != 0:
+        raise ValueError(f"Unclosed '{stack[-1]}'")
+    emit_line('return "".join(out)')
+    py_code = "\n".join(out)
+    compiled_code = compile(py_code, "<string>", "exec")
+
+    def wrapper(**kwargs_as_globals):
+        exec(compiled_code, kwargs_as_globals)
+        return kwargs_as_globals["_render"]()
+
+    return wrapper
+
+
+def normalise_ws(text):
+    return " ".join(text.split())
+
+
+# Take a multi-line pattern and use fnmatch against each line, to find a
+# sequence of lines that all match. The matching sequence will be printed.
+def do_match_tool(args):
+    # Prepare patterns
+    patterns = [normalise_ws(line) for line in args.patterns.splitlines()]
+    num_patterns = len(patterns)
+
+    if num_patterns == 0:
+        print(f"Error: No patterns provided", file=sys.stderr)
+        return 1
+
+    last_lines = deque(maxlen=num_patterns)
+
+    for line in sys.stdin:
+        last_lines.append(normalise_ws(line))
+
+        # Check for match only when the buffer is full
+        if len(last_lines) == num_patterns:
+            if all(
+                fnmatch.fnmatch(buf_line, pat)
+                for buf_line, pat in zip(last_lines, patterns)
+            ):
+                for line in last_lines:
+                    print(line)
+                return 0  # Success
+
+    # No match found
+    return 1
+
+
+# Create a checkout of llvm-test-suite in the given target directory.
+def do_create(args):
+    tgt_dir = pathlib.Path(args.tgt_dir)
+    if tgt_dir.exists():
+        print(
+            f"Error: Target directory '{args.tgt_dir}' already exists", file=sys.stderr
+        )
+        return 1
+
+    print(f"Cloning llvm-test-suite into {args.tgt_dir}...")
+    git_cmd = ["git", "clone"]
+    if args.reference:
+        git_cmd.extend(["--reference", args.reference])
+    git_cmd.extend(["https://github.com/llvm/llvm-test-suite", tgt_dir])
+
+    result = subprocess.run(git_cmd, check=True)
+    return result.returncode
+
+
+def check_in_test_suite_root():
+    # If we have a lit.site.cfg.in with known string, assume we are in the
+    # root.
+    check_file = pathlib.Path("lit.site.cfg.in")
+    if not check_file.exists() or "@TEST_SUITE_" not in check_file.read_text():
+        print("Error: not in llvm-test-suite root directory", file=sys.stderr)
+        sys.exit(1)
+
+
+# Infer cxx as clang++ for clang, g++ for gcc.
+def get_cxx_from_cc(cc):
+    cc_name = cc.name
+    cc_parent = cc.parent
+
+    cxx = None
+    if cc_name.endswith("clang"):
+        cxx = cc_parent / f"{cc_name}++"
+    elif cc_name.endswith("gcc"):
+        cxx = cc_parent / (cc_name[:-3] + "g++")
+
+    if not cxx or not cxx.exists() or not os.access(cxx, os.X_OK):
+        print(
+            f"Error: Couldn't determine C++ compiler paired with specified C compiler '{cc}'",
+            file=sys.stederr,
+        )
+        sys.exit(1)
+
+    return cxx
+
+
+cross_rebuild_sh_template_str = r"""#!/bin/sh
+# Generated by suite-helper
+CONF={{q(args.conf)}}
+CC={{q(args.cc)}}
+CXX={{q(args.cxx)}}
+CFLAGS={{q(args.cflags or "")}}
+SYSROOT={{q(args.sysroot)}}
+$ if 'clang' in args.cc.name
+TARGET={{q(args.target)}}
+$ endif
+
+error() {
+  printf "!!!!!!!!!! Error for config '%s': %s !!!!!!!!!!\n" "$CONF" "$*" >&2
+  exit 1
+}
+info() {
+  printf "@@@@@@@@@@ %s @@@@@@@@@@\n" "$*"
+}
+
+if [ -x "build.$CONF" ]; then
+  info "Build directory 'build.$CONF' exists. Deleting."
+  rm -rf "build.$CONF"
+fi
+
+cat - <<EOF > $CONF.cmake
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSROOT "$SYSROOT")
+set(CMAKE_C_COMPILER "$CC")
+set(CMAKE_CXX_COMPILER "$CXX")
+set(CMAKE_C_FLAGS_INIT "$CFLAGS")
+set(CMAKE_CXX_FLAGS_INIT "$CFLAGS")
+set(CMAKE_C_COMPILER_TARGET "$TARGET")
+set(CMAKE_CXX_COMPILER_TARGET "$TARGET")
+$ if 'clang' in args.cc.name
+set(CMAKE_LINKER_TYPE LLD)
+$ endif
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+EOF
+
+info "Dumping toolchain file for config '$CONF'"
+cat $CONF.cmake
+
+set -x
+
+cmake -G Ninja \
+  -B build.$CONF \
+  --toolchain=$CONF.cmake \
+$ if args.spec2017_dir
+  -DTEST_SUITE_SPEC2017_ROOT={{q(args.spec2017_dir)}} \
+$ endif
+$ if args.extra_cmake_args
+  {{args.extra_cmake_args}} \
+$ endif
+  || error "configure failed"
+
+printf "%s\n" "$(date -u '+%Y-%m-%d %H:%M:%S')" > build.$CONF/buildinfo.txt
+printf "%s\n" "$(md5sum "$CC" | cut -d ' ' -f 1)" >> build.$CONF/buildinfo.txt
+printf "%s\n" "$(md5sum _rebuild-$CONF.sh | cut -d ' ' -f 1)" >> build.$CONF/buildinfo.txt
+
+cmake --build build.$CONF "$@" || error "build failed"
+"""
+
+native_rebuild_sh_template_str = r"""#!/bin/sh
+# Generated by suite-helper
+CONF={{q(args.conf)}}
+CC={{q(args.cc)}}
+CXX={{q(args.cxx)}}
+CFLAGS={{q(args.cflags or "")}}
+
+error() {
+  printf "!!!!!!!!!! Error for config '%s': %s !!!!!!!!!!\n" "$CONF" "$*" >&2
+  exit 1
+}
+info() {
+  printf "@@@@@@@@@@ %s @@@@@@@@@@\n" "$*"
+}
+
+if [ -x "build.$CONF" ]; then
+  info "Build directory 'build.$CONF' exists. Deleting."
+  rm -rf "build.$CONF"
+fi
+
+info "Dumping options used for config '$CONF'"
+printf "CONF=%s\n" "$CONF"
+printf "CC=%s\n" "$CC"
+printf "CXX=%s\n" "$CXX"
+printf "CFLAGS=%s\n" "$CFLAGS"
+
+set -x
+
+cmake -G Ninja \
+  -B build.$CONF \
+  -DCMAKE_C_COMPILER="$CC" \
+  -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_C_FLAGS="$CFLAGS" \
+  -DCMAKE_CXX_FLAGS="$CFLAGS" \
+$ if 'clang' in args.cc.name
+  -DCMAKE_LINKER_TYPE=LLD \
+$ endif
+$ if args.spec2017_dir
+  -DTEST_SUITE_SPEC2017_ROOT={{q(args.spec2017_dir)}} \
+$ endif
+$ if args.extra_cmake_args
+  {{args.extra_cmake_args}} \
+$ endif
+  || error "configure failed"
+
+printf "%s\n" "$(date -u '+%Y-%m-%d %H:%M:%S')" > build.$CONF/buildinfo.txt
+printf "%s\n" "$(md5sum "$CC" | cut -d ' ' -f 1)" >> build.$CONF/buildinfo.txt
+printf "%s\n" "$(md5sum _rebuild-$CONF.sh | cut -d ' ' -f 1)" >> build.$CONF/buildinfo.txt
+
+cmake --build build.$CONF "$@" || error "build failed"
+"""
+
+
+def chmod_x(path):
+    # Set executable bit where read access is set, approximating the behaviour
+    # of chmod +x.
+    cur_mode = path.stat().st_mode
+    path.chmod(cur_mode | ((cur_mode & 0o444) >> 2))
+
+
+# Create a suite build configuration using either the 'cross' or 'native'
+# template. _rebuild-foo.sh is can be run afterwards in order to build it.
+def do_add_config(args):
+    check_in_test_suite_root()
+    build_dir = pathlib.Path(f"build.{args.conf}")
+    if build_dir.exists():
+        print(
+            f"Error: build directory build.{args.conf} for config {args.conf} already exists",
+            file=sys.stderr,
+        )
+        return 1
+    if "-save-temps=obj" not in (args.cflags or ""):
+        print(
+            "Info: --cflags not set or does not contain '-save-temps=obj'. Include this in order to allow asm diffing."
+        )
+    rebuild_sh = pathlib.Path(f"_rebuild-{args.conf}.sh")
+
+    def q(obj):
+        return shlex.quote(str(obj))
+
+    args.cxx = get_cxx_from_cc(args.cc)
+
+    if args.template == "cross":
+        template = compile_template(cross_rebuild_sh_template_str)
+    elif args.template == "native":
+        template = compile_template(native_rebuild_sh_template_str)
+    rebuild_sh.write_text(template(args=args, q=q))
+    chmod_x(rebuild_sh)
+
+    print(
+        f"Info: Configuration '{args.conf}' successfully created from template '{args.template}'."
+    )
+    print(
+        f"Info: _rebuild-{args.conf}.sh created. Use ./_rebuild-{args.conf}.sh to build.'"
+    )
+
+    return 0
+
+
+_file_md5_cache = {}
+
+
+def compare_md5_for_file(file_path, expected_md5):
+    if file_path in _file_md5_cache:
+        return _file_md5_cache[file_path] == expected_md5
+
+    file_md5 = hashlib.md5(file_path.read_bytes()).hexdigest()
+    _file_md5_cache[file_path] = file_md5
+    return file_md5 == expected_md5
+
+
+# Given a string that might either be a config name or a string for the build
+# path, return an appropriate bare config and pathlib.Path. e.g.:
+# foo => foo, pathlib.Path(build.foo)
+# build.foo => foo, pathlib.Path(build.foo)
+# Does not check that the path exists.
+def get_conf_name_and_build_path(name_or_path):
+    name_or_path = name_or_path.rstrip("/")
+    if name_or_path.startswith("build."):
+        return name_or_path[6:], pathlib.Path(name_or_path)
+    return name_or_path, pathlib.Path(f"build.{name_or_path}")
+
+
+# Print a listing that attempts to indicate the detected build configurations
+# and whether they are up to date or not.
+def do_status(args):
+    # For all build.* directories, look for buildinfo.txt and if present use
+    # it to determine if the compiler binary and the rebuild script are
+    # unchanged since the last build.
+    cwd = pathlib.Path(".")
+    configs = []
+    for d in cwd.glob("build.*"):
+        config_name = d.name.split(".", 1)[1]
+        if (d / "buildinfo.txt").exists() and (
+            cwd / f"_rebuild-{config_name}.sh"
+        ).exists():
+            configs.append(config_name)
+    if len(configs) == 0:
+        print("No suite-helper managed build directories found.")
+        return 0
+    for config in sorted(configs):
+        print(f"{config}: ")
+        buildinfo_path = pathlib.Path(f"build.{config}") / "buildinfo.txt"
+        buildinfo_lines = buildinfo_path.read_text().splitlines()
+        if len(buildinfo_lines) < 3:
+            print("  Invalid buildinfo.txt")
+            continue
+        timestamp_str = buildinfo_lines[0]
+        compiler_md5_recorded = buildinfo_lines[1]
+        rebuild_script_md5_recorded = buildinfo_lines[2]
+        rebuild_script_text = (cwd / f"_rebuild-{config}.sh").read_text()
+        cc_match = re.search(r"^CC=(.+)$", rebuild_script_text, re.MULTILINE)
+        if cc_match:
+            compiler_binary = shlex.split(cc_match.group(1))[0]
+        if not compiler_binary:
+            print("  Could not extract CC from rebuild script")
+            continue
+        compiler_binary_path = pathlib.Path(compiler_binary)
+        if not compiler_binary_path.exists():
+            print(f"  CC '{compiler_binary_path}' no longer exists")
+            continue
+        rebuild_script_path = pathlib.Path(f"_rebuild-{config}.sh")
+        up_to_date = True
+        if not compare_md5_for_file(compiler_binary_path, compiler_md5_recorded):
+            up_to_date = False
+            print("  CC md5 has changed since last build")
+        if not compare_md5_for_file(rebuild_script_path, rebuild_script_md5_recorded):
+            up_to_date = False
+            print(f"  {rebuild_script_path} has changed since last build")
+            continue
+        results_json_path = pathlib.Path(f"_results-{config}.json")
+        if (
+            results_json_path.exists()
+            and buildinfo_path.stat().st_mtime > results_json_path.stat().st_mtime
+        ):
+            print(
+                f"  Results out of date. build.{config}/buildinfo.txt newer than _results-{config}.json"
+            )
+        if up_to_date:
+            print(f"  Up to date. Last built at {timestamp_str}")
+    return 0
+
+
+# Run llvm-lit for the given build. Any additional arguments are passed on to
+# lit.
+def do_run(args):
+    print(f"Running build: {args.build}")
+    conf_name, build_path = get_conf_name_and_build_path(args.build)
+    if not build_path.exists() or not build_path.is_dir():
+        print(f"Cannot find existing build directory for config '{conf_name}'")
+        return 1
+    lit_path = args.lit_bin
+    if not lit_path:
+        lit_path = shutil.which("llvm-lit")
+    if not lit_path:
+        lit_path = shutil.which("lit")
+    if not lit_path:
+        print("Cannot find 'llvm-lit' or 'lit' on PATH")
+        return 1
+    print(f"Using lit at path {lit_path}")
+    cmd = [lit_path, build_path, "-o", f"_results-{conf_name}.json"] + args.remainder
+    print(f"Executing: ", end="")
+    print(*cmd, sep=" ")
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+# Query ninja and process its output to try to produce and execute a compiler
+# command that will emit a .ll for the given input file (e.g. a .c file).
+# Warning: While the below has worked well in practice for me, it's very
+# possible some of the logic could break for different build configurations.
+def do_get_ll(args):
+    conf_name, build_path = get_conf_name_and_build_path(args.conf)
+    if not build_path.exists() or not build_path.is_dir():
+        print(f"Cannot find existing build directory for config '{conf_name}'")
+        return 1
+    print(f"Attempting to retrieve .ll for {args.source_file} from config {conf_name}")
+    try:
+        compdb_result = subprocess.run(
+            ["ninja", "-C", str(build_path), "-t", "compdb"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        compdb_data = json.loads(compdb_result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to execute ninja command: {e}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse compilation database: {e}")
+        return 1
+
+    source_file_resolved = args.source_file.resolve()
+    for entry in compdb_data:
+        entry_file_resolved = pathlib.Path(entry["file"]).resolve()
+        if entry_file_resolved == source_file_resolved:
+            print(f"Found matching entry for {args.source_file}")
+            found_entry = entry
+            break
+    if not found_entry:
+        print("Failed to find matching entry for {args.source_file}")
+        return 1
+    original_compile_command = entry["command"]
+    print(f"Found compile command:\n{original_compile_command}\n")
+    compile_command = original_compile_command.split()
+    # Remove any call to 'timeit' (which in llvm-test-suite, is always called
+    # with two additional arguments).
+    if compile_command[0].endswith("timeit"):
+        compile_command = compile_command[3:]
+    # Delete -MD and all elements after it.
+    if "-MD" in compile_command:
+        md_index = compile_command.index("-MD")
+        compile_command = compile_command[:md_index]
+    compile_command += [
+        "-c",
+        str(args.source_file),
+        "-emit-llvm",
+        "-S",
+        "-o",
+        "retrieved.ll",
+    ]
+    print(f"Executing rewritten compile command:")
+    print(*compile_command, sep=" ")
+    print()
+    # Execute command with shell as the json can include shell quoted
+    # arguments that we'd otherwise have to unquote.
+    result = subprocess.run(" ".join(compile_command), shell=True)
+    if result.returncode == 0:
+        print("SUCCESS: LLVM IR emitted to retrieved.ll")
+    return result.returncode
+
+
+# Gets the .ll for the given source file, then attemts to run llvm-reduce on
+# it using the match-tool subtool to match against a multiline sequence of
+# glob patterns. Rather than providing lots of configuration hooks, the
+# expectation is you edit the generating interesting.sh yourself if you have
+# slightly different needs.
+def do_reduce_ll(args):
+    conf_name, build_path = get_conf_name_and_build_path(args.conf)
+    if not build_path.exists() or not build_path.is_dir():
+        print(f"Cannot find existing build directory for config '{conf_name}'")
+        return 1
+    returncode = do_get_ll(args)
+    if returncode != 0:
+        print("get-ll step failed")
+        return 1
+
+    def q(obj):
+        return shlex.quote(str(obj))
+
+    interesting_sh_str = f"""#!/bin/sh
+{q(args.llc_bin)} {args.llc_args or ""} < $1 | {q(pathlib.Path(__file__).resolve())} match-tool {q(args.patterns)}
+"""
+    interesting_sh = pathlib.Path("interesting.sh")
+    interesting_sh.write_text(interesting_sh_str)
+    chmod_x(interesting_sh)
+    return subprocess.run(
+        [args.reduce_bin, "--test=./interesting.sh", "retrieved.ll"]
+    ).returncode
+
+
+def nonexistent_path(path_str):
+    path = pathlib.Path(path_str).expanduser()
+    if path.exists():
+        raise argparse.ArgumentTypeError(f"'{path}' already exists")
+    return path
+
+
+def existing_path(path_str):
+    path = pathlib.Path(path_str).expanduser()
+    if not path.exists():
+        raise argparse.ArgumentTypeError(f"'{path}' does not exist")
+    return path
+
+
+def dir_path(path_str):
+    path = existing_path(path_str)
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(f"'{path}' is not a directory")
+    return path
+
+
+def file_path(path_str):
+    path = existing_path(path_str)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"'{path}' is not a file")
+    return path
+
+
+def executable_path(path_str):
+    path = file_path(path_str)
+    if not os.access(path, os.X_OK):
+        raise argparse.ArgumentTypeError(f"'{path}' is not executable")
+    return path
+
+
+def main():
+    # If there is a `--` then collect any arguments after that separately.
+    # They will not be seen by argparse.
+    if "--" in sys.argv:
+        double_dash_idx = sys.argv.index("--")
+        passthrough_args = sys.argv[double_dash_idx + 1 :]
+        sys.argv = sys.argv[:double_dash_idx]
+    else:
+        passthrough_args = []
+
+    parser = argparse.ArgumentParser(description="Suite Helper Tool")
+
+    subparsers = parser.add_subparsers(
+        dest="command", help="Command to run", required=True
+    )
+
+    match_parser = subparsers.add_parser("match-tool", help="Match patterns in input")
+    match_parser.add_argument("patterns", help="Multiline patterns to match")
+    match_parser.set_defaults(func=do_match_tool)
+
+    create_parser = subparsers.add_parser(
+        "create",
+        help="Checkout llvm-test-suite referencing existing checkout if possible",
+    )
+    create_parser.add_argument(
+        "tgt_dir", type=nonexistent_path, help="Target directory llvm-test-suite"
+    )
+    create_parser.add_argument(
+        "--reference",
+        type=dir_path,
+        help="Path to existing llvm-test-suite checkout to reference git objects",
+    )
+    create_parser.set_defaults(func=do_create)
+
+    add_config_parser = subparsers.add_parser(
+        "add-config", help="Add a new build configuration"
+    )
+    add_config_parser.add_argument(
+        "template", choices=["cross", "native"], help="Template to use"
+    )
+    add_config_parser.add_argument("conf", help="Name for build config")
+    add_config_parser.add_argument(
+        "--cc",
+        required=True,
+        type=executable_path,
+        help="Path to C compiler executable",
+    )
+    add_config_parser.add_argument(
+        "--target",
+        help="(clang-based cross only) Target triple, e.g. riscv64-linux-gnu",
+    )
+    add_config_parser.add_argument(
+        "--sysroot", type=dir_path, help="(cross only) Path to compiler executable"
+    )
+    add_config_parser.add_argument("--cflags", help="Additional compiler flags")
+    add_config_parser.add_argument(
+        "--spec2017-dir", type=dir_path, help="Path to SPEC CPU2017 directory"
+    )
+    add_config_parser.add_argument(
+        "--extra-cmake-args", help="Additional CMake arguments"
+    )
+    add_config_parser.set_defaults(func=do_add_config)
+
+    status_parser = subparsers.add_parser("status", help="Show current status")
+    status_parser.set_defaults(func=do_status)
+
+    run_parser = subparsers.add_parser(
+        "run", help="Run a build (extra args for lit can be given after a --)"
+    )
+    run_parser.add_argument("build", help="Build to run")
+    run_parser.add_argument(
+        "--lit-bin", type=executable_path, help="Path to lit binary"
+    )
+    run_parser.set_defaults(func=do_run)
+
+    get_ll_parser = subparsers.add_parser(
+        "get-ll", help="Retrieve .ll for given C source"
+    )
+    get_ll_parser.add_argument("conf", help="Name of build config to use")
+    get_ll_parser.add_argument(
+        "source_file", type=file_path, help="Path to C/C++ source"
+    )
+    get_ll_parser.set_defaults(func=do_get_ll)
+
+    reduce_ll_parser = subparsers.add_parser(
+        "reduce-ll",
+        help="Get .ll and attempt to reduce matching the given multiline asm pattern",
+    )
+    reduce_ll_parser.add_argument("conf", help="Name of build config to use")
+    reduce_ll_parser.add_argument(
+        "source_file", type=file_path, help="Path to C/C++ source"
+    )
+    reduce_ll_parser.add_argument("patterns", help="Multiline patterns to match")
+    reduce_ll_parser.add_argument(
+        "--reduce-bin",
+        required=True,
+        type=executable_path,
+        help="Path to llvm-reduce binary",
+    )
+    reduce_ll_parser.add_argument(
+        "--llc-bin", required=True, type=executable_path, help="Path to llc binary"
+    )
+    reduce_ll_parser.add_argument("--llc-args", help="Any args to pass to llc")
+    reduce_ll_parser.set_defaults(func=do_reduce_ll)
+
+    args = parser.parse_args()
+    if args.command == "add-config" and args.template == "cross":
+        if not args.sysroot:
+            parser.error("--sysroot required for 'cross' template")
+        if "clang" in args.cc.name and not args.target:
+            parser.error(
+                "--target required for 'cross' template with clang-based compiler"
+            )
+    args.remainder = passthrough_args
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
