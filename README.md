@@ -6,6 +6,12 @@ This repository contains small helper scripts or utilities that don't seem to
 merit their own repository, but probably deserve a better home than a
 throwaway Gist.
 
+## suite-helper
+
+A helper script for working with llvm-test-suite build configurations. Written
+up in more detail at [the Muxup suite-helper
+page](https://muxup.com/suite-helper).
+
 ## instruction_to_pcode
 
 A simple wrapper around [pypcode](https://github.com/angr/pypcode) to dump the
