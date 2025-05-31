@@ -117,7 +117,6 @@ def process_bin_with_objdump(bin_path):
     cur_fn = None
     cur_fn_addr = None
     active_tbs = []
-    remaining_insts_in_cur_tb = 0
     symbol_def_re = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:$")
     insn_re = re.compile(r"^\s*([0-9a-f]+):\s+([0-9a-f]+)\s+([\w.]+)(?:\s+(.+))?$")
 
@@ -127,7 +126,7 @@ def process_bin_with_objdump(bin_path):
             cur_fn_addr = int(cur_fn_addr, 16)
         elif match := insn_re.match(line):
             addr, enc, mnemonic, operands = match.groups()
-            if cur_fn == None:
+            if cur_fn is None:
                 raise SystemExit(
                     f"Encountered instruction at {addr:x} outside of any function"
                 )
@@ -991,7 +990,7 @@ if __name__ == "__main__":
             return []
         requested_anas = argval.split(",")
         for ana in requested_anas:
-            if not ana in analyses_map:
+            if ana not in analyses_map:
                 raise SystemExit("Unrecognised analysis")
         return requested_anas
 
