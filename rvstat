@@ -101,7 +101,8 @@ def parse_qemu_out(log_path):
 disasm_map = {}
 
 
-def process_bin_with_objdump(bin_path):
+def process_bin_with_objdump(bin_path, no_profile_data):
+    processed_insts = 0
     process = subprocess.Popen(
         ["llvm-objdump", "-d", "--section=.text", bin_path],
         stdout=subprocess.PIPE,
@@ -124,35 +125,52 @@ def process_bin_with_objdump(bin_path):
         if match := symbol_def_re.match(line):
             cur_fn_addr, cur_fn = match.groups()
             cur_fn_addr = int(cur_fn_addr, 16)
+            if no_profile_data:
+                # Create a TB for the whole symbol if we have no profile data.
+                # We'll update the instruction count later.
+                tb_for_fn = TBInfo(cur_fn_addr, 1, 0, 1, cur_fn, f"<{cur_fn}>", [])
+                tbs[cur_fn_addr] = tb_for_fn
+                active_tbs = [tb_for_fn]
         elif match := insn_re.match(line):
+            processed_insts += 1
             addr, enc, mnemonic, operands = match.groups()
+            addr = int(addr, 16)
             if cur_fn is None:
                 raise SystemExit(
                     f"Encountered instruction at {addr:x} outside of any function"
                 )
-            addr = int(addr, 16)
             cur_insn = MIInfo(addr, mnemonic, operands, len(enc) >> 1)
             disasm_map[addr] = cur_insn
-            if addr in tbs:
-                offset_in_fn = addr - cur_fn_addr
-                tbs[addr].loc_desc = (
-                    f"<{cur_fn}+{offset_in_fn:x}>" if offset_in_fn else f"<{cur_fn}>"
-                )
-                tbs[addr].fn_name = cur_fn
-                new_tb = tbs[addr]
-                active_tbs.append((new_tb, new_tb.icount))
+            if not no_profile_data:
+                if addr in tbs:
+                    offset_in_fn = addr - cur_fn_addr
+                    tbs[addr].loc_desc = (
+                        f"<{cur_fn}+{offset_in_fn:x}>"
+                        if offset_in_fn
+                        else f"<{cur_fn}>"
+                    )
+                    tbs[addr].fn_name = cur_fn
+                    new_tb = tbs[addr]
+                    active_tbs.append((new_tb, new_tb.icount))
 
-            # Process the instruction for all active translation blocks
-            for i, (tb_info, remaining) in enumerate(active_tbs):
-                if remaining > 0:
-                    tb_info.insts.append(cur_insn)
-                    active_tbs[i] = (tb_info, remaining - 1)
-            # Filter out completed TBs with a list comprehension
-            active_tbs = [
-                (tb_info, remaining)
-                for tb_info, remaining in active_tbs
-                if remaining > 0
-            ]
+                # Process the instruction for all active translation blocks
+                for i, (tb_info, remaining) in enumerate(active_tbs):
+                    if remaining > 0:
+                        tb_info.insts.append(cur_insn)
+                        active_tbs[i] = (tb_info, remaining - 1)
+                # Filter out completed TBs with a list comprehension
+                active_tbs = [
+                    (tb_info, remaining)
+                    for tb_info, remaining in active_tbs
+                    if remaining > 0
+                ]
+            else:
+                # If we have no profile data, we must have only one item in
+                # active_tbs (a tb representing the whole function) and just
+                # need to add the instruction to it.
+                tb_for_fn = active_tbs[0]
+                tb_for_fn.insts.append(cur_insn)
+                tb_for_fn.icount += 1
         elif line == "\n":
             continue
         elif "file format elf" in line:
@@ -165,6 +183,7 @@ def process_bin_with_objdump(bin_path):
     returncode = process.wait()
     if returncode != 0:
         raise subprocess.CalledProcessError(returncode, process.args)
+    return processed_insts
 
 
 def analysis_dump(tb_list, total_exec_inst_count):
@@ -971,6 +990,11 @@ if __name__ == "__main__":
         help="List of analyses to report on per-function of filtered input basis, separated by commas",
     )
     parser.add_argument("--filter", action="append", help="Filter to be applied")
+    parser.add_argument(
+        "--binary-only",
+        action="store_true",
+        help="Perform analysis without runtime data",
+    )
     # TODO: add help that lists the supported analyses and filters
 
     args = parser.parse_args()
@@ -982,7 +1006,7 @@ if __name__ == "__main__":
 
     if not bin_path.exists():
         raise SystemExit("Can't find binary")
-    if not log_paths:
+    if not args.binary_only and not log_paths:
         raise SystemExit("Can't find any .qemu_out")
 
     def parse_analyses_arg(argval):
@@ -999,9 +1023,17 @@ if __name__ == "__main__":
     perfn_analyses = parse_analyses_arg(args.per_fn)
 
     total_execed_instcount = 0
-    for log_path in log_paths:
-        total_execed_instcount += parse_qemu_out(log_path)
-    process_bin_with_objdump(bin_path)
+    if not args.binary_only:
+        for log_path in log_paths:
+            total_execed_instcount += parse_qemu_out(log_path)
+    total_processed_insts = process_bin_with_objdump(bin_path, args.binary_only)
+    # Set the executed instruction count to the number of processed
+    # instructions if we have no profile data.
+    if args.binary_only:
+        print(
+            "!!!!!!!!!! NOTE: --binary-only was passed meaning no profiling data is available. 'execution count' of each instruction is assumed to be 1."
+        )
+        total_execed_instcount = total_processed_insts
 
     filtered_tb_list = list(tbs.values())
 
@@ -1014,6 +1046,8 @@ if __name__ == "__main__":
     for filt in filters:
         old_len = len(filtered_tb_list)
         if filt.startswith("toptbs:"):
+            if args.binary_only:
+                raise SystemExit("topbbs filter can't be used without profile data")
             n = int(filt[len("toptbs:") :])
             if n <= 0:
                 raise SystemExit("Illegal toptbs filter value")
