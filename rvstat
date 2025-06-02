@@ -974,11 +974,22 @@ def analysis_itype(tb_list, total_exec_inst_count, extra_cmdline_args):
         return v / execed_total * 100
 
     # Print counts
-    print(f"total: {execed_total} (100%)\n")
-    for count_name, count_val in counts.items():
-        if count_val == 0:
-            continue
-        print(f"{count_name}: {count_val} ({pct(count_val):.2f}%)")
+    if extra_cmdline_args:
+        print(
+            f"INFO: Printing only 'total' and counts that match the patterns: {extra_cmdline_args}\n"
+        )
+        print(f"total: {execed_total} (100%)\n")
+        for count_name, count_val in counts.items():
+            if count_val != 0 and any(
+                fnmatch.fnmatch(count_name, pattern) for pattern in extra_cmdline_args
+            ):
+                print(f"{count_name}: {count_val} ({pct(count_val):.2f}%)")
+    else:
+        print(f"total: {execed_total} (100%)\n")
+        for count_name, count_val in counts.items():
+            if count_val == 0:
+                continue
+            print(f"{count_name}: {count_val} ({pct(count_val):.2f}%)")
 
 
 analyses_map = {
