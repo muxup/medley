@@ -946,6 +946,8 @@ def analysis_itype(tb_list, total_exec_inst_count, extra_cmdline_args):
         "control_flow/ret": 0,
         "compressed": 0,
         "noncompressed": 0,
+        "stack_store": 0,
+        "stack_load": 0,
         # TODO stack loads / stack stores
         # TODO vector int
         # TODO vector FP
@@ -967,7 +969,10 @@ def analysis_itype(tb_list, total_exec_inst_count, extra_cmdline_args):
                 counts["compressed"] += tb.ecount
             else:
                 counts["noncompressed"] += tb.ecount
-
+            if "scalar_store" in count_list and "(sp)" in inst.operands:
+                counts["stack_store"] += tb.ecount
+            elif "scalar_load" in count_list and "(sp)" in inst.operands:
+                counts["stack_load"] += tb.ecount
             execed_total += tb.ecount
 
     def pct(v):
