@@ -989,22 +989,45 @@ analyses_desc = {
 }
 
 if __name__ == "__main__":
+
+    def valid_analysis(arg):
+        # Must be a key from analyses_desc, or one of those keys in name:args
+        # format.
+        if ":" not in arg:
+            base_arg = arg
+        else:
+            base_arg, arg_str = arg.split(":", 1)
+            if not arg_str:
+                raise argparse.ArgumentTypeError(
+                    "If ':' is used, it must be followed by a non-empty argument string."
+                )
+        if base_arg not in analyses_desc:
+            msg = f"Analysis must be one of {list(analyses_desc.keys())} or start with these followed by ':args'"
+            raise argparse.ArgumentTypeError(msg)
+        return arg
+
     parser = argparse.ArgumentParser(description="instruction stats from qemu log")
     parser.add_argument("binary")
     parser.add_argument(
         "--whole",
-        type=str,
-        help="List of analyses to report on a whole filtered input basis, separated by commas",
+        action="append",
+        type=valid_analysis,
+        default=[],
+        help="Analysis to report on a whole filtered input basis. Specify multiple times for multiple analyses.",
     )
     parser.add_argument(
         "--per-tb",
-        type=str,
-        help="List of analyses to report on per-TB of filtered input basis, separated by commas",
+        action="append",
+        type=valid_analysis,
+        default=[],
+        help="Analysis to report on per-TB of filtered input basis. Specify multiple times for multiple analyses.",
     )
     parser.add_argument(
         "--per-fn",
-        type=str,
-        help="List of analyses to report on per-function of filtered input basis, separated by commas",
+        action="append",
+        type=valid_analysis,
+        default=[],
+        help="Analysis to report on per-function of filtered input basis. Specify multiple times for multiple analyses.",
     )
     parser.add_argument("--filter", action="append", help="Filter to be applied")
     parser.add_argument(
@@ -1026,14 +1049,16 @@ if __name__ == "__main__":
     if not args.binary_only and not log_paths:
         raise SystemExit("Can't find any .qemu_out")
 
-    def parse_analyses_arg(argval):
-        if not argval:
-            return []
-        requested_anas = argval.split(",")
-        for ana in requested_anas:
-            if ana not in analyses_map:
-                raise SystemExit("Unrecognised analysis")
-        return requested_anas
+    def parse_analyses_arg(analyses_list):
+        result = []
+        for item in analyses_list:
+            if ":" in item:
+                name, args_str = item.split(":", 1)
+                args_list = args_str.split(",")
+                result.append([name, args_list])
+            else:
+                result.append(item)
+        return result
 
     whole_analyses = parse_analyses_arg(args.whole)
     pertb_analyses = parse_analyses_arg(args.per_tb)
@@ -1101,8 +1126,9 @@ if __name__ == "__main__":
     # Perform analysis
     for tb in filtered_tb_list:
         for ana in pertb_analyses:
-            print(f"{analyses_desc[ana]} for TB at {hex(tb.pc)} {tb.loc_desc}")
-            analyses_map[ana]([tb], total_execed_instcount)
+            ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
+            print(f"{analyses_desc[ana_name]} for TB at {hex(tb.pc)} {tb.loc_desc}")
+            analyses_map[ana_name]([tb], total_execed_instcount)
             print()
 
     tbs_by_fn = defaultdict(list)
@@ -1113,11 +1139,13 @@ if __name__ == "__main__":
         tbs_by_fn[tb_fn_name].append(tb)
     for k, v in tbs_by_fn.items():
         for ana in perfn_analyses:
-            print(f"{analyses_desc[ana]} for function {k}:")
-            analyses_map[ana](v, total_execed_instcount)
+            ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
+            print(f"{analyses_desc[ana_name]} for function {k}:")
+            analyses_map[ana_name](v, total_execed_instcount)
             print()
 
     for ana in whole_analyses:
-        print(f"{analyses_desc[ana]} for all filtered input:")
-        analyses_map[ana](filtered_tb_list, total_execed_instcount)
+        ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
+        print(f"{analyses_desc[ana_name]} for all filtered input:")
+        analyses_map[ana_name](filtered_tb_list, total_execed_instcount)
         print()
