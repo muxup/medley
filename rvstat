@@ -319,6 +319,7 @@ inst_types = {
     "ret": ["ext_i", "control_flow/ret", "control_flow"],
     "pause": ["ext_i"],
     "zext.b": ["ext_i", "int_alu"],
+    "unimp": ["ext_i"],
     # Zicsr instructions
     "csrrw": ["ext_zicsr"],
     "csrrs": ["ext_zicsr"],
