@@ -1054,6 +1054,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Perform analysis without runtime data",
     )
+    parser.add_argument(
+        "--sort-tbs-by-addr",
+        action="store_true",
+        help="Sort translation blocks by their address after filters and before calling analyses",
+    )
     # TODO: add help that lists the supported analyses and filters
 
     args = parser.parse_args()
@@ -1141,6 +1146,9 @@ if __name__ == "__main__":
         print(
             f"Applied {filt} filter, reducing TBs from {old_len} to {len(filtered_tb_list)}"
         )
+
+    if args.sort_tbs_by_addr:
+        filtered_tb_list.sort(key=lambda tb: tb.pc)
 
     # Perform analysis
     for tb in filtered_tb_list:
