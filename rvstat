@@ -319,6 +319,21 @@ inst_types = {
     "ret": ["ext_i", "control_flow/ret", "control_flow"],
     "pause": ["ext_i"],
     "zext.b": ["ext_i", "int_alu"],
+    # Zicsr instructions
+    "csrrw": ["ext_zicsr"],
+    "csrrs": ["ext_zicsr"],
+    "csrrc": ["ext_zicsr"],
+    "csrrwi": ["ext_zicsr"],
+    "csrrsi": ["ext_zicsr"],
+    "csrrci": ["ext_zicsr"],
+    # Zicsr pseudos
+    "csrr": ["ext_zicsr"],
+    "csrw": ["ext_zicsr"],
+    "csrs": ["ext_zicsr"],
+    "csrc": ["ext_zicsr"],
+    "csrwi": ["ext_zicsr"],
+    "csrsi": ["ext_zicsr"],
+    "csrci": ["ext_zicsr"],
     # M instructions
     "mul": ["ext_m", "int_mul"],
     "mulh": ["ext_m", "int_mul"],
@@ -891,6 +906,7 @@ def analysis_itype(tb_list, total_exec_inst_count):
     # printing order.
     counts = {
         "ext_i": 0,
+        "ext_zicsr": 0,
         "ext_m": 0,
         "ext_a": 0,
         "ext_f": 0,
