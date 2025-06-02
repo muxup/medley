@@ -186,7 +186,7 @@ def process_bin_with_objdump(bin_path, no_profile_data):
     return processed_insts
 
 
-def analysis_dump(tb_list, total_exec_inst_count):
+def analysis_dump(tb_list, total_exec_inst_count, extra_cmndline_args):
     tb_count = len(tb_list)
     cur_tb_num = 1
     for tb in tb_list:
@@ -199,7 +199,7 @@ def analysis_dump(tb_list, total_exec_inst_count):
         cur_tb_num += 1
 
 
-def analysis_exec(tb_list, total_execed_inst_count):
+def analysis_exec(tb_list, total_execed_inst_count, extra_cmdline_args):
     tb_list_execed_inst_count = 0
     for tb in tb_list:
         tb_list_execed_inst_count += tb.icount * tb.ecount
@@ -211,7 +211,7 @@ def analysis_exec(tb_list, total_execed_inst_count):
     )
 
 
-def analysis_mnemonic(tb_list, total_exec_inst_count):
+def analysis_mnemonic(tb_list, total_exec_inst_count, extra_cmdline_args):
     histogram = {}
     for tb in tb_list:
         for inst in tb.insts:
@@ -220,11 +220,19 @@ def analysis_mnemonic(tb_list, total_exec_inst_count):
             else:
                 histogram[inst.mnemonic] = 1 * tb.ecount
     sorted_histogram = dict(sorted(histogram.items(), key=lambda x: x[1], reverse=True))
-    for k, v in sorted_histogram.items():
-        print(k, v)
+    if extra_cmdline_args:
+        print(
+            f"INFO: Printing only mnemonics that match the patterns: {extra_cmdline_args}\n"
+        )
+        for k, v in sorted_histogram.items():
+            if any(fnmatch.fnmatch(k, pattern) for pattern in extra_cmdline_args):
+                print(k, v)
+    else:
+        for k, v in sorted_histogram.items():
+            print(k, v)
 
 
-def analysis_badinsn(tb_list, total_exec_inst_count):
+def analysis_badinsn(tb_list, total_exec_inst_count, extra_cmdline_args):
     for tb in tb_list:
         for inst in tb.insts:
             if inst.mnemonic == "mv" or inst.mnemonic.startswith("fmv"):
@@ -902,7 +910,7 @@ inst_types = {
 }
 
 
-def analysis_itype(tb_list, total_exec_inst_count):
+def analysis_itype(tb_list, total_exec_inst_count, extra_cmdline_args):
     # Explicitly list counts rather than using defaultdict so we can control
     # printing order.
     counts = {
@@ -1055,7 +1063,7 @@ if __name__ == "__main__":
             if ":" in item:
                 name, args_str = item.split(":", 1)
                 args_list = args_str.split(",")
-                result.append([name, args_list])
+                result.append([name, *args_list])
             else:
                 result.append(item)
         return result
@@ -1128,7 +1136,7 @@ if __name__ == "__main__":
         for ana in pertb_analyses:
             ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
             print(f"{analyses_desc[ana_name]} for TB at {hex(tb.pc)} {tb.loc_desc}")
-            analyses_map[ana_name]([tb], total_execed_instcount)
+            analyses_map[ana_name]([tb], total_execed_instcount, ana_args)
             print()
 
     tbs_by_fn = defaultdict(list)
@@ -1141,11 +1149,11 @@ if __name__ == "__main__":
         for ana in perfn_analyses:
             ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
             print(f"{analyses_desc[ana_name]} for function {k}:")
-            analyses_map[ana_name](v, total_execed_instcount)
+            analyses_map[ana_name](v, total_execed_instcount, ana_args)
             print()
 
     for ana in whole_analyses:
         ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
         print(f"{analyses_desc[ana_name]} for all filtered input:")
-        analyses_map[ana_name](filtered_tb_list, total_execed_instcount)
+        analyses_map[ana_name](filtered_tb_list, total_execed_instcount, ana_args)
         print()
