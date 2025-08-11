@@ -32,6 +32,7 @@ class TBInfo:
     fn_name: str
     loc_desc: str
     insts: list[MIInfo]
+    from_mapping: tuple[pathlib.Path, int]
 
 
 tbs = {}
@@ -50,20 +51,16 @@ def parse_qemu_out(log_path):
     total_execed_instcount = 0
     with log_path.open() as file:
         current_state = StatParseState.SEEKING_HEADER_1
-        expected_max_entries = (2**64) - 1
+        total_expected_entries = None
         for line in file:
             if current_state == StatParseState.SEEKING_HEADER_1:
                 match = re.match(
-                    r"^collected (\d+) entries in the hash table \(showing up to (\d+)\)",
+                    r"^collected (\d+) entries in the hash table",
                     line,
                 )
                 if not match:
                     continue
-                if match.group(2) != str(expected_max_entries):
-                    print(
-                        "Warning: there was a limit on the number of collected hot blocks",
-                        file=sys.stderr,
-                    )
+                total_expected_entries = int(match.group(1))
                 current_state = StatParseState.SEEKING_HEADER_2
             elif current_state == StatParseState.SEEKING_HEADER_2:
                 if line != "pc, tcount, icount, ecount\n":
@@ -83,15 +80,24 @@ def parse_qemu_out(log_path):
 
                 total_execed_instcount += icount * ecount
                 if pc in tbs:
-                    tbs[pc].tcount += tcount
-                    tbs[pc].ecount += ecount
                     if tbs[pc].icount != icount:
                         print(
-                            f"Warning: mismatched icount. {icount} for {pc} from {log_path} doesnt equal previously read icount {tbs[pc].icount}"
+                            f"Warning: mismatched icount. {icount} for {pc:#x} (executed {ecount} times) from {log_path} doesnt equal previously collated info: icount={tbs[pc].icount}, ecount={tbs[pc].ecount}."
                         )
+                        # As we merge these duplicate entires, len(tbs) will
+                        # be reduced by 1 vs the number of entries in the
+                        # file.
+                        total_expected_entries -= 1
+                    tbs[pc].tcount += tcount
+                    tbs[pc].ecount += ecount
                 else:
-                    tbs[pc] = TBInfo(pc, tcount, icount, ecount, "", "", [])
+                    tbs[pc] = TBInfo(pc, tcount, icount, ecount, "", "", [], (None, -1))
 
+    if len(tbs) != total_expected_entries:
+        print(
+            f"Warning: collected information on {len(tbs)} blocks, but should have collected {total_expected_entries}.",
+            file=sys.stderr,
+        )
     print(
         f"Collected information from {log_path} on {len(tbs)} TBs, and {total_execed_instcount} dynamically executed instructions"
     )
@@ -101,10 +107,130 @@ def parse_qemu_out(log_path):
 disasm_map = {}
 
 
-def process_bin_with_objdump(bin_path, no_profile_data):
+def calculate_adjust_vma(map_start_addr, map_file_offset, binary_path):
+    cmd = ["llvm-readelf", "-l", binary_path]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=True, encoding="utf-8"
+    )
+
+    # Parse the readelf output to find the executable LOAD segment, getting
+    # its file offset and virtual address.
+    # The target line looks like:
+    #   LOAD   <Offset>         <VirtAddr>         ... R E
+    # We need to capture the segment's file offset and its virtual address.
+    pattern = re.compile(
+        r"^\s*LOAD\s+([0-9a-fx]+)\s+([0-9a-fx]+)\s+.*\s+R\s+E", re.IGNORECASE
+    )
+
+    elf_file_offset_str = None
+    elf_virt_addr_str = None
+
+    for line in result.stdout.splitlines():
+        match = pattern.search(line)
+        if match:
+            elf_file_offset_str = match.group(1)
+            elf_virt_addr_str = match.group(2)
+            break
+
+    if not elf_file_offset_str or not elf_virt_addr_str:
+        raise SystemExit(
+            f"Error: Could not find the executable 'R E' LOAD segment in '{binary_path}'."
+        )
+
+    elf_file_offset = int(elf_file_offset_str, 16)
+    elf_virt_addr = int(elf_virt_addr_str, 16)
+
+    # Perform the calculation.
+    # The formula is: Load Base Address = Runtime Address - ELF Virtual Address
+    # First, find the exact runtime address where the code segment begins.
+    # Runtime Address = (Mapping Start Address) + (Code Segment File Offset - Mapping File Offset)
+    runtime_code_addr = map_start_addr + (elf_file_offset - map_file_offset)
+    # Now, calculate the load base address.
+    load_base_addr = runtime_code_addr - elf_virt_addr
+
+    return load_base_addr
+
+
+def parse_single_map_file(filepath: pathlib.Path) -> list[tuple[pathlib.Path, int]]:
+    executable_mappings = []
+    seen_filenames = set()
+
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("0x"):
+                continue
+
+            parts = line.split(maxsplit=5)
+            if len(parts) < 5:
+                continue
+            start_addr = parts[0]
+            end_addr = parts[1]  # noqa
+            size = parts[2]  # noqa
+            offset = parts[3]
+            perms = parts[4]
+            filename = parts[5] if len(parts) > 5 else None
+
+            # Only capture mappings with filenames that are exectabuel.
+            if (not filename) or filename.startswith("["):
+                continue
+            if "x" not in perms:
+                continue
+
+            if filename in seen_filenames:
+                raise ValueError(f"Can't handled repeated filename {filename}")
+
+            seen_filenames.add(filename)
+            adjust_vma_offset = calculate_adjust_vma(
+                int(start_addr, 16), int(offset, 16), filename
+            )
+            executable_mappings.append((pathlib.Path(filename), adjust_vma_offset))
+
+    executable_mappings.sort(key=lambda x: x[1])
+    return executable_mappings
+
+
+def process_map_files(map_files: list[pathlib.Path]) -> list[tuple[pathlib.Path, int]]:
+    reference_mapping = None
+
+    # Process all map files and error out if they're not equivalent.
+    for map_file in map_files:
+        current_mapping = parse_single_map_file(map_file)
+        if reference_mapping is None:
+            reference_mapping = current_mapping
+            continue
+        if current_mapping != reference_mapping:
+            raise ValueError(
+                "Mismatch in executable mappings found between "
+                f"'{map_files[0]}' and '{map_file}'. "
+                "All executable lines must be identical across all map files."
+            )
+
+    return reference_mapping
+
+
+def process_bins_with_objdump(mappings, no_profile_data):
+    if no_profile_data and len(mappings) > 1:
+        raise ValueError("only support a single mapping with no_profile_data")
+
     processed_insts = 0
+    for mapping in mappings:
+        processed_insts += process_bin_with_objdump(mapping, no_profile_data)
+    return processed_insts
+
+
+def process_bin_with_objdump(mapping, no_profile_data):
+    bin_path, in_mem_start_addr = mapping
+    processed_insts = 0
+    vma_adjustment = in_mem_start_addr
+
     process = subprocess.Popen(
-        ["llvm-objdump", "-d", "--section=.text", bin_path],
+        [
+            "llvm-objdump",
+            "-d",
+            f"--adjust-vma={vma_adjustment}",
+            bin_path,
+        ],
         stdout=subprocess.PIPE,
         stderr=None,
         text=True,
@@ -128,7 +254,9 @@ def process_bin_with_objdump(bin_path, no_profile_data):
             if no_profile_data:
                 # Create a TB for the whole symbol if we have no profile data.
                 # We'll update the instruction count later.
-                tb_for_fn = TBInfo(cur_fn_addr, 1, 0, 1, cur_fn, f"<{cur_fn}>", [])
+                tb_for_fn = TBInfo(
+                    cur_fn_addr, 1, 0, 1, cur_fn, f"<{cur_fn}>", [], mapping
+                )
                 tbs[cur_fn_addr] = tb_for_fn
                 active_tbs = [tb_for_fn]
         elif match := insn_re.match(line):
@@ -150,6 +278,7 @@ def process_bin_with_objdump(bin_path, no_profile_data):
                         else f"<{cur_fn}>"
                     )
                     tbs[addr].fn_name = cur_fn
+                    tbs[addr].from_mapping = mapping
                     new_tb = tbs[addr]
                     active_tbs.append((new_tb, new_tb.icount))
 
@@ -175,7 +304,10 @@ def process_bin_with_objdump(bin_path, no_profile_data):
             continue
         elif "file format elf" in line:
             continue
-        elif line == "Disassembly of section .text:\n":
+        elif (
+            line == "Disassembly of section .text:\n"
+            or line == "Disassembly of section .plt:\n"
+        ):
             continue
         else:
             print(f"!!!!! skipping '{line}'")
@@ -194,7 +326,8 @@ def analysis_dump(tb_list, total_exec_inst_count, extra_cmndline_args):
             f"TB {cur_tb_num}/{tb_count}: {hex(tb.pc)} {tb.loc_desc} ({tb.icount} insts executed {tb.ecount} times)"
         )
         for inst in tb.insts:
-            print(f"{hex(inst.pc)}: {inst.mnemonic} {inst.operands}")
+            operands_str = f" {inst.operands}" if inst.operands else ""
+            print(f"{hex(inst.pc)}: {inst.mnemonic}{operands_str}")
         print()
         cur_tb_num += 1
 
@@ -1053,6 +1186,14 @@ if __name__ == "__main__":
         default=[],
         help="Analysis to report on per-function of filtered input basis. Specify multiple times for multiple analyses.",
     )
+
+    parser.add_argument(
+        "--per-obj",
+        action="append",
+        type=valid_analysis,
+        default=[],
+        help="Analysis to report on per-object of filtered input basis. Specify multiple times for multiple analyses.",
+    )
     parser.add_argument("--filter", action="append", help="Filter to be applied")
     parser.add_argument(
         "--binary-only",
@@ -1071,12 +1212,18 @@ if __name__ == "__main__":
     bin_dir = bin_path.parent
     if bin_dir == pathlib.Path():
         bin_dir = pathlib.Path(".")
-    log_paths = bin_dir.glob(f"{bin_path.name}.qemu_out*")
+    log_paths = list(bin_dir.glob(f"{bin_path.name}.qemu_out*"))
+    map_paths = list(bin_dir.glob(f"{bin_path.name}.map*"))
 
     if not bin_path.exists():
         raise SystemExit("Can't find binary")
-    if not args.binary_only and not log_paths:
-        raise SystemExit("Can't find any .qemu_out")
+    if not args.binary_only:
+        if not log_paths:
+            raise SystemExit("Can't find any .qemu_out")
+        if len(log_paths) != len(map_paths):
+            raise SystemExit(
+                "Number of found log files didn't match number of found map files"
+            )
 
     def parse_analyses_arg(analyses_list):
         result = []
@@ -1092,19 +1239,23 @@ if __name__ == "__main__":
     whole_analyses = parse_analyses_arg(args.whole)
     pertb_analyses = parse_analyses_arg(args.per_tb)
     perfn_analyses = parse_analyses_arg(args.per_fn)
+    perobj_analyses = parse_analyses_arg(args.per_obj)
 
     total_execed_instcount = 0
     if not args.binary_only:
         for log_path in log_paths:
             total_execed_instcount += parse_qemu_out(log_path)
-    total_processed_insts = process_bin_with_objdump(bin_path, args.binary_only)
-    # Set the executed instruction count to the number of processed
-    # instructions if we have no profile data.
-    if args.binary_only:
-        print(
-            "!!!!!!!!!! NOTE: --binary-only was passed meaning no profiling data is available. 'execution count' of each instruction is assumed to be 1."
-        )
-        total_execed_instcount = total_processed_insts
+        mappings = process_map_files(map_paths)
+        total_processed_insts = process_bins_with_objdump(mappings, False)
+    else:
+        total_processed_insts = process_bin_with_objdump((bin_path, 0), True)
+        # Set the executed instruction count to the number of processed
+        # instructions if we have no profile data.
+        if args.binary_only:
+            print(
+                "!!!!!!!!!! NOTE: --binary-only was passed meaning no profiling data is available. 'execution count' of each instruction is assumed to be 1."
+            )
+            total_execed_instcount = total_processed_insts
 
     filtered_tb_list = list(tbs.values())
 
@@ -1146,6 +1297,17 @@ if __name__ == "__main__":
                     elif tb.pc == int(tb_addr, 16):
                         new_filtered_tb_list.append(tb)
             filtered_tb_list = new_filtered_tb_list
+        elif filt.startswith("obj:"):
+            obj_names = filt[len("obj:") :].split(",")
+            new_filtered_tb_list = []
+            for tb in filtered_tb_list:
+                if not tb.from_mapping[0]:
+                    continue
+                for obj_name in obj_names:
+                    if fnmatch.fnmatch(tb.from_mapping[0], obj_name):
+                        new_filtered_tb_list.append(tb)
+                        continue
+            filtered_tb_list = new_filtered_tb_list
         else:
             raise SystemExit("Unrecognised filter")
         print(
@@ -1173,6 +1335,18 @@ if __name__ == "__main__":
         for ana in perfn_analyses:
             ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
             print(f"{analyses_desc[ana_name]} for function {k}:")
+            analyses_map[ana_name](v, total_execed_instcount, ana_args)
+            print()
+
+    tbs_by_obj = defaultdict(list)
+    for tb in filtered_tb_list:
+        if not tb.from_mapping[0]:
+            continue
+        tbs_by_obj[tb.from_mapping[0]].append(tb)
+    for k, v in tbs_by_obj.items():
+        for ana in perobj_analyses:
+            ana_name, *ana_args = ana if isinstance(ana, list) else (ana,)
+            print(f"{analyses_desc[ana_name]} for object {k}:")
             analyses_map[ana_name](v, total_execed_instcount, ana_args)
             print()
 
