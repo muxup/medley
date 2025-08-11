@@ -1272,6 +1272,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Sort translation blocks by their address after filters and before calling analyses",
     )
+    parser.add_argument(
+        "--select-run",
+        help="Only load information from the given numbered run. e.g. 0, 1, or -1 for the last one available.",
+    )
     # TODO: add help that lists the supported analyses and filters
 
     args = parser.parse_args()
@@ -1279,8 +1283,8 @@ if __name__ == "__main__":
     bin_dir = bin_path.parent
     if bin_dir == pathlib.Path():
         bin_dir = pathlib.Path(".")
-    log_paths = list(bin_dir.glob(f"{bin_path.name}.qemu_out*"))
-    map_paths = list(bin_dir.glob(f"{bin_path.name}.map*"))
+    log_paths = sorted(bin_dir.glob(f"{bin_path.name}.qemu_out*"))
+    map_paths = sorted(bin_dir.glob(f"{bin_path.name}.map*"))
 
     if not bin_path.exists():
         raise SystemExit("Can't find binary")
@@ -1291,6 +1295,15 @@ if __name__ == "__main__":
             raise SystemExit(
                 "Number of found log files didn't match number of found map files"
             )
+    if args.binary_only and args.select_run:
+        raise SystemExit("Can't use --binary-only with --select-run")
+
+    if args.select_run:
+        try:
+            log_paths = [log_paths[int(args.select_run)]]
+            map_paths = [map_paths[int(args.select_run)]]
+        except Exception:
+            raise SystemExit(f"Can't apply --select-run index {args.select_run}")
 
     def parse_analyses_arg(analyses_list):
         result = []
