@@ -1,0 +1,340 @@
+#!/bin/sh
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+# A shared sandbox tool, providing at least some filesystem isolation for
+# less trusted applications using unshare and nsenter. See
+# https://muxup.com/shandbox for more details.
+#
+# Two sets of namespaces are used to provide this isolation: the outer
+# 'shandbox_root' has the user mapped to root within the namespace and retains
+# access to standard / (allowing us to mount additional paths into after the
+# sandbox has started). The inner 'shandbox_user' represents a new user
+# namepsace mapping our uid/gid to an unprivileged user, but other namespaces
+# are shared with 'shandbox_root'. Sandboxed processes are launched within
+# the namespaces of 'shandbox_user'.
+#
+# By convention, paths in variables prefixed with `SB_` are paths from the
+# perspective of within the sandbox. Other paths are from the perspective of
+# our normal unmodified filesystem layout.
+#
+# Within the sandbox, HOME is /home/sandbox. Unless you edit SANDBOX_HOME_DIR
+# below, this is /home/$youruser/sandbox.
+
+set -eu
+
+# Configuration options you may want to edit.
+SANDBOX_HOME_DIR="$HOME/sandbox"
+HOME_FILES_TO_MAP=".bashrc .vimrc"
+HOME_DIRS_TO_MAP=".vim bin"
+SB_HOME="/home/sandbox"
+SB_PATH="$SB_HOME/bin:/usr/local/bin:/usr/bin"
+
+# Configuration options you are less likely to want to edit.
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/shandbox"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  RUN_DIR="$XDG_RUNTIME_DIR/shandbox"
+else
+  RUN_DIR="/tmp/shandbox-$(whoami)"
+fi
+CHROOT_DIR="$DATA_DIR/root"
+LOG_FILE="$RUN_DIR/log"
+
+mkdir -p "$RUN_DIR"
+touch "$LOG_FILE"
+
+die() {
+  printf "%s\n" "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+  printf '%s\n' "$*"
+}
+
+# Read the pid from one of our named pid files and print it, returning
+# non-zero on failure. Perform some basic validation that we have a numeric
+# pid that refers to a currently running process.
+read_pid() {
+  local pid
+  read -r pid < "$RUN_DIR/${1}_pid" 2>/dev/null
+  case "$pid" in
+    *[!0-9]*|'') return 1 ;;
+  esac
+  [ -d "/proc/$pid" ] && echo "$pid"
+}
+
+# Get the pid of the first child, returning non-zero on failure.
+find_child() {
+  local child
+  read -r child _ < "/proc/$1/task/$1/children" 2>/dev/null || true
+  [ -n "${child:-}" ] && echo "$child"
+}
+
+is_running() {
+  read_pid shandbox_user >/dev/null 2>&1
+}
+
+# Start the sandbox if it doesn't appear to be running.
+ensure_running() {
+  is_running || cmd_start
+}
+
+# Start the sandbox by ensuring the necessary root layout is in place, then
+# creating the namespaces and recording the pids of the processes associated
+# with them.
+cmd_start() {
+  if is_running; then
+    die "already running (pid $(read_pid shandbox_user))"
+  fi
+
+  local sb_uid="$(id -u)"
+  local sb_gid="$(id -g)"
+
+  # Ensure we create the necessary directories and files to set up the
+  # filesystem for our sandbox appropriately. The mounts happen within the
+  # outer 'shandbox_root' environment, but we can set up the necessary
+  # directories here. Bind-mounting a particular file requires that a file
+  # with that name already exists too.
+  mkdir -p \
+    "$CHROOT_DIR/usr" \
+    "$CHROOT_DIR/etc" \
+    "$CHROOT_DIR/dev" \
+    "$CHROOT_DIR/proc" \
+    "$CHROOT_DIR/sys" \
+    "$CHROOT_DIR/tmp" \
+    "$CHROOT_DIR/run/systemd/resolve" \
+    "$CHROOT_DIR/home/sandbox" \
+    "$SANDBOX_HOME_DIR" \
+    "$RUN_DIR/run"
+  touch "$CHROOT_DIR/run/systemd/resolve/stub-resolv.conf"
+  mkdir -p "$CHROOT_DIR/run/user/$sb_uid"
+  for f in $HOME_FILES_TO_MAP; do
+    [ -f "$HOME/$f" ] || continue
+    touch "$SANDBOX_HOME_DIR/$f"
+  done
+  for d in $HOME_DIRS_TO_MAP; do
+    [ -d "$HOME/$d" ] || continue
+    mkdir -p "$SANDBOX_HOME_DIR/$d"
+  done
+  # Create the conventional symlinks within the root directory.
+  ln -sfn usr/bin "$CHROOT_DIR/bin"
+  ln -sfn usr/lib "$CHROOT_DIR/lib"
+  ln -sfn usr/lib "$CHROOT_DIR/lib64"
+  # Set up a fake /etc/passwd so the user within the sandbox appears as
+  # 'sandbox'.
+  cat - <<EOF > "$RUN_DIR/passwd"
+root:x:0:0::/root:/usr/bin/nologin
+nobody:x:65534:65534::/:/usr/bin/nologin
+sandbox:x:$sb_uid:$sb_gid::/home/sandbox:/usr/bin/bash
+EOF
+
+  # Create the 'shandbox_root' sandbox which includes the shared mount
+  # namespace, perform mounts, then set up the 'shandbox_user' inner namespace
+  # that will be used for launching programs. We set the variables needed for
+  # the heredoc script as environment variables.
+  CHROOT_DIR="$CHROOT_DIR" \
+  SANDBOX_HOME_DIR="$SANDBOX_HOME_DIR" \
+  SB_UID="$sb_uid" \
+  SB_GID="$sb_gid" \
+  RUN_DIR="$RUN_DIR" \
+  HOME_FILES_TO_MAP="$HOME_FILES_TO_MAP" \
+  HOME_DIRS_TO_MAP="$HOME_DIRS_TO_MAP" \
+  SB_HOME="$SB_HOME" \
+  SB_PATH="$SB_PATH" \
+  unshare --mount --ipc --pid --user --fork --kill-child --map-root-user -- \
+    /bin/sh <<'EOF' &
+set -eu
+mount --make-rprivate /
+mount --bind "$CHROOT_DIR" "$CHROOT_DIR"
+mount -o rbind,ro,nosuid,nodev /usr "$CHROOT_DIR/usr"
+mount -o rbind,ro,nosuid,nodev /etc "$CHROOT_DIR/etc"
+mount -o bind,ro "$RUN_DIR/passwd" "$CHROOT_DIR/etc/passwd"
+mount -o bind,ro,nosuid,nodev /run/systemd/resolve/stub-resolv.conf "$CHROOT_DIR/run/systemd/resolve/stub-resolv.conf"
+mount -o bind,nosuid,nodev "$RUN_DIR/run" "$CHROOT_DIR/run/user/$SB_UID"
+mount -o rbind,ro,nosuid,nodev /sys "$CHROOT_DIR/sys"
+mount -o rbind,nosuid /dev "$CHROOT_DIR/dev"
+mount -o rbind,nosuid,nodev /tmp "$CHROOT_DIR/tmp"
+mount -o bind,nosuid,nodev "$SANDBOX_HOME_DIR" "$CHROOT_DIR/home/sandbox"
+mount -t proc proc "$CHROOT_DIR/proc"
+for f in $HOME_FILES_TO_MAP; do
+  [ -f "$HOME/$f" ] || continue
+  mount -o bind,ro,nosuid,nodev "$HOME/$f" "$CHROOT_DIR/home/sandbox/$f"
+done
+for d in $HOME_DIRS_TO_MAP; do
+  [ -d "$HOME/$d" ] || continue
+  mount -o rbind,ro,nosuid,nodev "$HOME/$d" "$CHROOT_DIR/home/sandbox/$d"
+done
+env -i HOME="$SB_HOME" PATH="$SB_PATH" TERM="${TERM:-xterm}" XDG_RUNTIME_DIR="/run/user/$SB_UID" \
+  unshare --user --map-user="$SB_UID" --map-group="$SB_GID" --root="$CHROOT_DIR" -- \
+  sleep infinity &
+wait
+EOF
+  local shandbox_root_pid shandbox_user_pid
+  local unshare_pid=$!
+  local i=0
+  while [ "$i" -lt 5 ]; do
+    if shandbox_root_pid=$(find_child "$unshare_pid"); then
+      if shandbox_user_pid=$(find_child "$shandbox_root_pid"); then
+        break
+      fi
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "${shandbox_user_pid:-}" ] || die "failed to start"
+  echo "$shandbox_root_pid" > "$RUN_DIR/shandbox_root_pid"
+  echo "$shandbox_user_pid" > "$RUN_DIR/shandbox_user_pid"
+  log "started (pid $shandbox_user_pid)"
+}
+
+# Attempt to kill the 'shandbox_user' process, which should result in
+# 'shandbox_root' terminating as well.
+cmd_stop() {
+  local i
+  is_running || die "not running"
+  kill "$(read_pid shandbox_user)" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 20 ] && is_running; do sleep 0.1; i=$((i + 1)); done
+  rm -f "$RUN_DIR/shandbox_root_pid" "$RUN_DIR/shandbox_user_pid"
+  log "stopped"
+}
+
+cmd_status() {
+  if ! is_running; then
+    echo "stopped"
+    return 1
+  fi
+
+  printf 'running (pid %s)\n\n' "$(read_pid shandbox_user)"
+  printf 'log:\n'
+  tail -20 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+}
+
+# Translate the host PWD to an in-sandbox path if it's trivial to do so (i.e.
+# the path is within the sandbox home).
+sandbox_wd() {
+  case "$PWD" in
+    "$SANDBOX_HOME_DIR"/*) echo "$SB_HOME${PWD#"$SANDBOX_HOME_DIR"}" ;;
+    "$SANDBOX_HOME_DIR")   echo "$SB_HOME" ;;
+    *)                     echo "$SB_HOME" ;;
+  esac
+}
+
+# Run the given command within the namespaces associated with the
+# 'shandbox_user' process. The current working directory will be translated to
+# an in-sandbox path if this can be done trivially. Environment variables are
+# not passed through.
+cmd_run() {
+  if [ $# -lt 1 ]; then
+    die "usage: shandbox run <command> [args...]"
+  fi
+  ensure_running
+
+  exec nsenter --preserve-credentials --env -U -m -i -p --root --wdns="$(sandbox_wd)" \
+    -t "$(read_pid shandbox_user)" -- "$@"
+}
+
+cmd_enter() {
+  cmd_run /usr/bin/bash
+}
+
+# Bind-mount a host path into the running sandbox.
+cmd_add_mount() {
+  local mount_opts="rbind,ro,nosuid,nodev"
+  if [ $# -lt 1 ]; then
+    die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
+  fi
+
+  case "$1" in
+    --read-write)
+      mount_opts='rbind,nosuid,nodev'
+      shift
+      ;;
+  esac
+
+  if [ "$#" -gt 2 ]; then
+    die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
+  fi
+
+  is_running || die "not running"
+
+  # Canonicalise paths and check we're not trying to mount at / or specify a
+  # path that tries to escape the sandbox root (e.g. through ../../). For the
+  # latter, we check the canonicalised target path starts with '$CHROOT_DIR/'.
+  local src dest target
+  src="$(realpath -e "$1")" || die "source path does not exist: $1"
+  dest="$2"
+  target="$(realpath -m "$CHROOT_DIR$dest")"
+  if [ "$dest" = "/" ]; then
+    die "cannot mount at sandbox root"
+  fi
+  if [ "${target#"$CHROOT_DIR"/}" = "$target" ]; then
+    die "path escapes sandbox root"
+  fi
+
+  # Perform the requested mount in the context of 'shandbox_root'. The mount
+  # point must also be created within that namespace, as we can't always
+  # easily determine what host-side path would match the desired path within
+  # the namespace. It's necessary to create the directory or file prior to
+  # mounting.
+  local shandbox_root_pid
+  shandbox_root_pid=$(read_pid shandbox_root) || die "shandbox root pid not found"
+  local mkdir_target="$target"
+  if [ -f "$src" ]; then
+    mkdir_target="$(dirname "$target")"
+  fi
+  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
+    mkdir -p "$mkdir_target" \
+    || die "failed to create mount point"
+  if [ -f "$src" ]; then
+    nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
+      touch "$target" \
+      || die "failed to create mount point"
+  fi
+  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
+    mount -o "$mount_opts" "$src" "$target" \
+    || die "mount failed"
+  log "mounted $src -> $dest"
+}
+
+# Take the given path and try to umount it within the 'shandbox_root'
+# namespace.
+cmd_remove_mount() {
+  if [ $# -lt 1 ]; then
+    die "usage: shandbox remove-mount <sandbox-path>"
+  fi
+  is_running || die "not running"
+
+  local shandbox_root_pid target
+  shandbox_root_pid=$(read_pid shandbox_root) || die "shandbox root pid not found"
+  target="$CHROOT_DIR$1"
+  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
+    umount "$target" || die "umount failed"
+  log "unmounted $1"
+}
+
+usage() {
+  printf 'usage: shandbox {start|stop|restart|status|enter|run|add-mount|remove-mount}\n' >&2
+}
+
+if [ $# -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+cmd="$1"; shift
+case "$cmd" in
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  restart)      cmd_stop 2>/dev/null || true; sleep 0.3; cmd_start ;;
+  status)       cmd_status ;;
+  enter)        cmd_enter ;;
+  run)          cmd_run "$@" ;;
+  add-mount)    cmd_add_mount "$@" ;;
+  remove-mount) cmd_remove_mount "$@" ;;
+  *)            usage; exit 1 ;;
+esac

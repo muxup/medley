@@ -6,6 +6,13 @@ This repository contains small helper scripts or utilities that don't seem to
 merit their own repository, but probably deserve a better home than a
 throwaway Gist.
 
+# shandbox
+
+A simple sandbox setup using `unshare` and `nsenter`, that will set up a
+shared environment for running less-trusted applications (e.g. agents and
+their output). See [the Muxup page on shandbox](https://muxup.com/shandbox)
+for more details.
+
 ## suite-helper
 
 A helper script for working with llvm-test-suite build configurations. Written
