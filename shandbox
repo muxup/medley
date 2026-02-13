@@ -60,7 +60,7 @@ log() {
 # pid that refers to a currently running process.
 read_pid() {
   local pid
-  read -r pid < "$RUN_DIR/${1}_pid" 2>/dev/null
+  read -r pid < "$RUN_DIR/${1}_pid" 2>/dev/null || return 1
   case "$pid" in
     *[!0-9]*|'') return 1 ;;
   esac
