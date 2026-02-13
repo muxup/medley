@@ -30,7 +30,7 @@ SANDBOX_HOME_DIR="$HOME/sandbox"
 HOME_FILES_TO_MAP=".bashrc .vimrc"
 HOME_DIRS_TO_MAP=".vim bin"
 SB_HOME="/home/sandbox"
-SB_PATH="$SB_HOME/bin:/usr/local/bin:/usr/bin"
+SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
 
 # Configuration options you are less likely to want to edit.
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/shandbox"
