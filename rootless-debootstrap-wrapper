@@ -97,7 +97,7 @@ done
 
 [ -n "$SUITE" ] || usag_error "Must set --suite"
 [ -n "$TARGET_DIR" ] || usage_error "Must set --target-dir"
-[ ! -e "$TARGET_DIR" ] || usge_error "Directory in --target-dir already exists, refusing to run"
+[ ! -e "$TARGET_DIR" ] || usage_error "Directory in --target-dir already exists, refusing to run"
 [ -z "$INCLUDE" ] && ARGSTR="$ARGSTR --include=fakeroot"
 
 ARGSTR="--foreign $ARGSTR $SUITE $TARGET_DIR"
