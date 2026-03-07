@@ -94,36 +94,6 @@ cmd_start() {
   local sb_uid="$(id -u)"
   local sb_gid="$(id -g)"
 
-  # Ensure we create the necessary directories and files to set up the
-  # filesystem for our sandbox appropriately. The mounts happen within the
-  # outer 'shandbox_root' environment, but we can set up the necessary
-  # directories here. Bind-mounting a particular file requires that a file
-  # with that name already exists too.
-  mkdir -p \
-    "$CHROOT_DIR/usr" \
-    "$CHROOT_DIR/etc" \
-    "$CHROOT_DIR/dev" \
-    "$CHROOT_DIR/proc" \
-    "$CHROOT_DIR/sys" \
-    "$CHROOT_DIR/tmp" \
-    "$CHROOT_DIR/run/systemd/resolve" \
-    "$CHROOT_DIR/home/sandbox" \
-    "$SANDBOX_HOME_DIR" \
-    "$RUN_DIR/run"
-  touch "$CHROOT_DIR/run/systemd/resolve/stub-resolv.conf"
-  mkdir -p "$CHROOT_DIR/run/user/$sb_uid"
-  for f in $HOME_FILES_TO_MAP; do
-    [ -f "$HOME/$f" ] || continue
-    touch "$SANDBOX_HOME_DIR/$f"
-  done
-  for d in $HOME_DIRS_TO_MAP; do
-    [ -d "$HOME/$d" ] || continue
-    mkdir -p "$SANDBOX_HOME_DIR/$d"
-  done
-  # Create the conventional symlinks within the root directory.
-  ln -sfn usr/bin "$CHROOT_DIR/bin"
-  ln -sfn usr/lib "$CHROOT_DIR/lib"
-  ln -sfn usr/lib "$CHROOT_DIR/lib64"
   # Set up a fake /etc/passwd so the user within the sandbox appears as
   # 'sandbox'.
   cat - <<EOF > "$RUN_DIR/passwd"
@@ -135,7 +105,11 @@ EOF
   # Create the 'shandbox_root' sandbox which includes the shared mount
   # namespace, perform mounts, then set up the 'shandbox_user' inner namespace
   # that will be used for launching programs. We set the variables needed for
-  # the heredoc script as environment variables.
+  # the heredoc script as environment variables. Mounts will happen within the
+  # outer 'shandbox_root' environment. Each dir or file mount requires that a
+  # dir/file with that name exists already. For simplicity, we do the
+  # necessary mkdir/touch just before the mount, within the script passed to
+  # 'unshare'.
   CHROOT_DIR="$CHROOT_DIR" \
   SANDBOX_HOME_DIR="$SANDBOX_HOME_DIR" \
   SB_UID="$sb_uid" \
@@ -148,24 +122,33 @@ EOF
   unshare --mount --ipc --pid --user --fork --kill-child --map-root-user -- \
     /bin/sh <<'EOF' &
 set -eu
+mkdir -p "$CHROOT_DIR" "$SANDBOX_HOME_DIR" "$RUN_DIR/run"
 mount --make-rprivate /
 mount --bind "$CHROOT_DIR" "$CHROOT_DIR"
-mount -o rbind,ro,nosuid,nodev /usr "$CHROOT_DIR/usr"
-mount -o rbind,ro,nosuid,nodev /etc "$CHROOT_DIR/etc"
+for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve; do
+  [ -e "$p" ] || continue
+  mkdir -p "$CHROOT_DIR$p"
+  mount -o rbind,ro,nosuid,nodev "$p" "$CHROOT_DIR$p"
+done
 mount -o bind,ro "$RUN_DIR/passwd" "$CHROOT_DIR/etc/passwd"
-mount -o bind,ro,nosuid,nodev /run/systemd/resolve/stub-resolv.conf "$CHROOT_DIR/run/systemd/resolve/stub-resolv.conf"
+mkdir -p "$CHROOT_DIR/run/user/$SB_UID"
 mount -o bind,nosuid,nodev "$RUN_DIR/run" "$CHROOT_DIR/run/user/$SB_UID"
-mount -o rbind,ro,nosuid,nodev /sys "$CHROOT_DIR/sys"
+mkdir -p "$CHROOT_DIR/dev"
 mount -o rbind,nosuid /dev "$CHROOT_DIR/dev"
+mkdir -p "$CHROOT_DIR/tmp"
 mount -o rbind,nosuid,nodev /tmp "$CHROOT_DIR/tmp"
+mkdir -p "$CHROOT_DIR/home/sandbox"
 mount -o bind,nosuid,nodev "$SANDBOX_HOME_DIR" "$CHROOT_DIR/home/sandbox"
+mkdir -p "$CHROOT_DIR/proc"
 mount -t proc proc "$CHROOT_DIR/proc"
 for f in $HOME_FILES_TO_MAP; do
   [ -f "$HOME/$f" ] || continue
+  touch "$SANDBOX_HOME_DIR/$f"
   mount -o bind,ro,nosuid,nodev "$HOME/$f" "$CHROOT_DIR/home/sandbox/$f"
 done
 for d in $HOME_DIRS_TO_MAP; do
   [ -d "$HOME/$d" ] || continue
+  mkdir -p "$SANDBOX_HOME_DIR/$d"
   mount -o rbind,ro,nosuid,nodev "$HOME/$d" "$CHROOT_DIR/home/sandbox/$d"
 done
 env -i HOME="$SB_HOME" PATH="$SB_PATH" TERM="${TERM:-xterm}" XDG_RUNTIME_DIR="/run/user/$SB_UID" \
@@ -179,7 +162,9 @@ EOF
   while [ "$i" -lt 5 ]; do
     if shandbox_root_pid=$(find_child "$unshare_pid"); then
       if shandbox_user_pid=$(find_child "$shandbox_root_pid"); then
-        break
+        if [ "$(cat "/proc/$shandbox_user_pid/comm" 2>/dev/null)" = "sleep" ]; then
+          break
+        fi
       fi
     fi
     sleep 0.1
