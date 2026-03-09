@@ -303,7 +303,7 @@ cmd_remove_mount() {
 }
 
 usage() {
-  printf 'usage: shandbox {start|stop|restart|status|enter|run|add-mount|remove-mount}\n' >&2
+  printf 'usage: shandbox {start|stop|status|enter|run|add-mount|remove-mount}\n' >&2
 }
 
 if [ $# -lt 1 ]; then
@@ -315,7 +315,6 @@ cmd="$1"; shift
 case "$cmd" in
   start)        cmd_start ;;
   stop)         cmd_stop ;;
-  restart)      cmd_stop 2>/dev/null || true; sleep 0.3; cmd_start ;;
   status)       cmd_status ;;
   enter)        cmd_enter ;;
   run)          cmd_run "$@" ;;
