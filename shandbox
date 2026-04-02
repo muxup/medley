@@ -74,6 +74,12 @@ find_child() {
   [ -n "${child:-}" ] && echo "$child"
 }
 
+nsenter_shandbox_root() {
+  local shandbox_root_pid="$1"
+  shift
+  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- "$@"
+}
+
 is_running() {
   read_pid shandbox_user >/dev/null 2>&1
 }
@@ -272,16 +278,13 @@ cmd_add_mount() {
   if [ -f "$src" ]; then
     mkdir_target="$(dirname "$target")"
   fi
-  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
-    mkdir -p "$mkdir_target" \
+  nsenter_shandbox_root "$shandbox_root_pid" mkdir -p "$mkdir_target" \
     || die "failed to create mount point"
   if [ -f "$src" ]; then
-    nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
-      touch "$target" \
+    nsenter_shandbox_root "$shandbox_root_pid" touch "$target" \
       || die "failed to create mount point"
   fi
-  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
-    mount -o "$mount_opts" "$src" "$target" \
+  nsenter_shandbox_root "$shandbox_root_pid" mount -o "$mount_opts" "$src" "$target" \
     || die "mount failed"
   log "mounted $src -> $dest"
 }
@@ -297,8 +300,7 @@ cmd_remove_mount() {
   local shandbox_root_pid target
   shandbox_root_pid=$(read_pid shandbox_root) || die "shandbox root pid not found"
   target="$CHROOT_DIR$1"
-  nsenter --preserve-credentials -U -m -i -p -t "$shandbox_root_pid" -- \
-    umount "$target" || die "umount failed"
+  nsenter_shandbox_root "$shandbox_root_pid" umount "$target" || die "umount failed"
   log "unmounted $1"
 }
 
