@@ -57,6 +57,16 @@ log() {
   printf '%s\n' "$*"
 }
 
+canonical_target_path() {
+  # Ensure the path stays within the sandbox root, and reject /.
+  local dest="$1"
+  local target
+  [ "$dest" != "/" ] || return 1
+  target="$(realpath -m "$CHROOT_DIR$dest")" || return 1
+  [ "${target#"$CHROOT_DIR"/}" != "$target" ] || return 1
+  printf '%s\n' "$target"
+}
+
 # Read the pid from one of our named pid files and print it, returning
 # non-zero on failure. Perform some basic validation that we have a numeric
 # pid that refers to a currently running process.
@@ -269,13 +279,7 @@ cmd_add_mount() {
   local src dest target
   src="$(realpath -e "$1")" || die "source path does not exist: $1"
   dest="$2"
-  target="$(realpath -m "$CHROOT_DIR$dest")"
-  if [ "$dest" = "/" ]; then
-    die "cannot mount at sandbox root"
-  fi
-  if [ "${target#"$CHROOT_DIR"/}" = "$target" ]; then
-    die "path escapes sandbox root"
-  fi
+  target="$(canonical_target_path "$dest")" || die "invalid sandbox path: $dest"
 
   # Perform the requested mount in the context of 'shandbox_root'. The mount
   # point must also be created within that namespace, as we can't always
@@ -308,7 +312,7 @@ cmd_remove_mount() {
 
   local target
   require_shandbox_root_pid
-  target="$CHROOT_DIR$1"
+  target="$(canonical_target_path "$1")" || die "invalid sandbox path: $1"
   nsenter_shandbox_root umount "$target" || die "umount failed"
   log "unmounted $1"
 }
