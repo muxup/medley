@@ -267,7 +267,7 @@ cmd_add_mount() {
       ;;
   esac
 
-  if [ "$#" -gt 2 ]; then
+  if [ "$#" -ne 2 ]; then
     die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
   fi
 
