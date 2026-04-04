@@ -41,8 +41,8 @@ else
 fi
 CHROOT_DIR="$DATA_DIR/root"
 LOG_FILE="$RUN_DIR/log"
-SHANDBOX_ROOT_PID=
-SHANDBOX_USER_PID=
+SHANDBOX_ROOT_PIDREF=
+SHANDBOX_USER_PIDREF=
 
 mkdir -p "$RUN_DIR"
 touch "$LOG_FILE"
@@ -67,16 +67,20 @@ canonical_target_path() {
   printf '%s\n' "$target"
 }
 
-# Read the pid from one of our named pid files and print it, returning
-# non-zero on failure. Perform some basic validation that we have a numeric
-# pid that refers to a currently running process.
-read_pid() {
-  local pid
-  read -r pid < "$RUN_DIR/${1}_pid" 2>/dev/null || return 1
-  case "$pid" in
-    *[!0-9]*|'') return 1 ;;
+# Read the pidref from one of our named pid files and print it, returning
+# non-zero on failure. Perform some basic validation that we have a pidref in
+# PID:pidfd_inode format that still refers to a running process.
+read_pidref() {
+  local pidfile="$RUN_DIR/${1}_pid"
+  local pidref
+  [ -r "$pidfile" ] || return 1
+  read -r pidref < "$pidfile" 2>/dev/null || return 1
+  case "$pidref" in
+    [0-9]*:[0-9]*) ;;
+    *) return 1 ;;
   esac
-  [ -d "/proc/$pid" ] && echo "$pid"
+  /usr/bin/kill -s 0 "$pidref" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$pidref"
 }
 
 # Get the pid of the first child, returning non-zero on failure.
@@ -87,19 +91,19 @@ find_child() {
 }
 
 require_shandbox_root_pid() {
-  SHANDBOX_ROOT_PID="$(read_pid shandbox_root)" || die "shandbox root pid not found"
+  SHANDBOX_ROOT_PIDREF="$(read_pidref shandbox_root)" || die "shandbox root pid not found"
 }
 
 require_shandbox_user_pid() {
-  SHANDBOX_USER_PID="$(read_pid shandbox_user)" || die "shandbox user pid not found"
+  SHANDBOX_USER_PIDREF="$(read_pidref shandbox_user)" || die "shandbox user pid not found"
 }
 
 nsenter_shandbox_root() {
-  nsenter --preserve-credentials -U -m -i -p -t "$SHANDBOX_ROOT_PID" -- "$@"
+  nsenter --preserve-credentials -U -m -i -p -t "$SHANDBOX_ROOT_PIDREF" -- "$@"
 }
 
 is_running() {
-  read_pid shandbox_user >/dev/null 2>&1
+  read_pidref shandbox_user >/dev/null 2>&1
 }
 
 # Start the sandbox if it doesn't appear to be running.
@@ -111,8 +115,9 @@ ensure_running() {
 # creating the namespaces and recording the pids of the processes associated
 # with them.
 cmd_start() {
-  if is_running; then
-    die "already running (pid $(read_pid shandbox_user))"
+  local pidref
+  if pidref="$(read_pidref shandbox_user)"; then
+    die "already running (pid ${pidref%%:*})"
   fi
 
   local sb_uid="$(id -u)"
@@ -180,7 +185,7 @@ env -i HOME="$SB_HOME" PATH="$SB_PATH" TERM="${TERM:-xterm}" XDG_RUNTIME_DIR="/r
   sleep infinity &
 wait
 EOF
-  local shandbox_root_pid shandbox_user_pid
+  local shandbox_root_pid shandbox_user_pid shandbox_root_pidref shandbox_user_pidref
   local unshare_pid=$!
   local i=0
   while [ "$i" -lt 5 ]; do
@@ -195,8 +200,10 @@ EOF
     i=$((i + 1))
   done
   [ "${shandbox_user_pid:-}" ] || die "failed to start"
-  echo "$shandbox_root_pid" > "$RUN_DIR/shandbox_root_pid"
-  echo "$shandbox_user_pid" > "$RUN_DIR/shandbox_user_pid"
+  shandbox_root_pidref="$(getino -p "$shandbox_root_pid")" || die "failed to get shandbox root pidref"
+  shandbox_user_pidref="$(getino -p "$shandbox_user_pid")" || die "failed to get shandbox user pidref"
+  echo "$shandbox_root_pidref" > "$RUN_DIR/shandbox_root_pid"
+  echo "$shandbox_user_pidref" > "$RUN_DIR/shandbox_user_pid"
   log "started (pid $shandbox_user_pid)"
 }
 
@@ -205,7 +212,8 @@ EOF
 cmd_stop() {
   local i
   is_running || die "not running"
-  kill "$(read_pid shandbox_user)" 2>/dev/null || true
+  require_shandbox_user_pid
+  /usr/bin/kill "$SHANDBOX_USER_PIDREF" 2>/dev/null || true
   i=0
   while [ "$i" -lt 20 ] && is_running; do sleep 0.1; i=$((i + 1)); done
   rm -f "$RUN_DIR/shandbox_root_pid" "$RUN_DIR/shandbox_user_pid"
@@ -219,7 +227,7 @@ cmd_status() {
   fi
 
   require_shandbox_user_pid
-  printf 'running (pid %s)\n\n' "$SHANDBOX_USER_PID"
+  printf 'running (pid %s)\n\n' "${SHANDBOX_USER_PIDREF%%:*}"
   printf 'log:\n'
   tail -20 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
 }
@@ -246,7 +254,7 @@ cmd_run() {
   require_shandbox_user_pid
 
   exec nsenter --preserve-credentials --env -U -m -i -p --root --wdns="$(sandbox_wd)" \
-    -t "$SHANDBOX_USER_PID" -- "$@"
+    -t "$SHANDBOX_USER_PIDREF" -- "$@"
 }
 
 cmd_enter() {
@@ -324,7 +332,7 @@ cmd_list_mounts() {
   if [ $# -gt 0 ] && [ "$1" = "--all" ]; then
     findmnt_args=
   fi
-  findmnt -N "$SHANDBOX_USER_PID" -l -n -o TARGET,SOURCE $findmnt_args
+  findmnt -N "${SHANDBOX_USER_PIDREF%%:*}" -l -n -o TARGET,SOURCE $findmnt_args
 }
 
 usage() {
