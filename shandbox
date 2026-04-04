@@ -317,8 +317,18 @@ cmd_remove_mount() {
   log "unmounted $1"
 }
 
+cmd_list_mounts() {
+  is_running || die "not running"
+  require_shandbox_user_pid
+  local findmnt_args="-R /home/sandbox"
+  if [ $# -gt 0 ] && [ "$1" = "--all" ]; then
+    findmnt_args=
+  fi
+  findmnt -N "$SHANDBOX_USER_PID" -l -n -o TARGET,SOURCE $findmnt_args
+}
+
 usage() {
-  printf 'usage: shandbox {start|stop|status|enter|run|add-mount|remove-mount}\n' >&2
+  printf 'usage: shandbox {start|stop|status|enter|run|add-mount|remove-mount|list-mounts}\n' >&2
 }
 
 if [ $# -lt 1 ]; then
@@ -335,5 +345,6 @@ case "$cmd" in
   run)          cmd_run "$@" ;;
   add-mount)    cmd_add_mount "$@" ;;
   remove-mount) cmd_remove_mount "$@" ;;
+  list-mounts)  cmd_list_mounts "$@" ;;
   *)            usage; exit 1 ;;
 esac
