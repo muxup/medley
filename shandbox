@@ -23,7 +23,6 @@
 # Within the sandbox, HOME is /home/sandbox. Unless you edit SANDBOX_HOME_DIR
 # below, this is /home/$youruser/sandbox.
 
-set -eu
 
 # Configuration options you may want to edit.
 SANDBOX_HOME_DIR="$HOME/sandbox"
@@ -34,7 +33,7 @@ SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
 
 # Configuration options you are less likely to want to edit.
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/shandbox"
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+if [ -n "$XDG_RUNTIME_DIR" ]; then
   RUN_DIR="$XDG_RUNTIME_DIR/shandbox"
 else
   RUN_DIR="/tmp/shandbox-$(whoami)"
@@ -87,7 +86,7 @@ make_pidref() {
   local pidref
   if command -v getino >/dev/null 2>&1; then
     pidref="$(getino -p "$1" 2>/dev/null)" || true
-    if [ -n "${pidref:-}" ]; then
+    if [ -n "$pidref" ]; then
       printf '%s\n' "$pidref"
       return
     fi
@@ -122,7 +121,7 @@ read_pidref() {
 find_child() {
   local child
   read -r child _ < "/proc/$1/task/$1/children" 2>/dev/null || true
-  [ -n "${child:-}" ] && echo "$child"
+  [ -n "$child" ] && echo "$child"
 }
 
 require_shandbox_root_pid() {
@@ -234,7 +233,7 @@ EOF
     sleep 0.1
     i=$((i + 1))
   done
-  [ "${shandbox_user_pid:-}" ] || die "failed to start"
+  [ "$shandbox_user_pid" ] || die "failed to start"
   shandbox_root_pidref="$(make_pidref "$shandbox_root_pid")" || die "failed to get shandbox root pidref"
   shandbox_user_pidref="$(make_pidref "$shandbox_user_pid")" || die "failed to get shandbox user pidref"
   echo "$shandbox_root_pidref" > "$RUN_DIR/shandbox_root_pid"
