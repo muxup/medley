@@ -67,19 +67,54 @@ canonical_target_path() {
   printf '%s\n' "$target"
 }
 
+# To protect against PID wraparound, we store more than just the PID. For
+# systems with new enough util-linux, we can't use getino to get a pid:inode
+# reference that is also accepted by kill and  nsenter. On older systems we
+# instead get the process start time from the processes' stat file and store
+# that as pid@start_time.
+
+# Return the process start time from /proc/PID/stat.
+pid_start_time() {
+  local stat start_time
+  [ -r "/proc/$1/stat" ] || return 1
+  read -r stat < "/proc/$1/stat" 2>/dev/null || return 1
+  stat="${stat##*) }"
+  start_time="$(printf '%s\n' "$stat" | cut -d ' ' -f20)" || return 1
+  printf '%s\n' "$start_time"
+}
+
+make_pidref() {
+  local pidref
+  if command -v getino >/dev/null 2>&1; then
+    pidref="$(getino -p "$1" 2>/dev/null)" || true
+    if [ -n "${pidref:-}" ]; then
+      printf '%s\n' "$pidref"
+      return
+    fi
+  fi
+  printf '%s@%s\n' "$1" "$(pid_start_time "$1")"
+}
+
 # Read the pidref from one of our named pid files and print it, returning
-# non-zero on failure. Perform some basic validation that we have a pidref in
-# PID:pidfd_inode format that still refers to a running process.
+# non-zero on failure. Perform some basic validation that we have a pidref that
+# still refers to a running process. For pid@start_time refs, print just the
+# pid so the result can be used directly with tools expecting a pid.
 read_pidref() {
   local pidfile="$RUN_DIR/${1}_pid"
-  local pidref
+  local pidref start_time
   [ -r "$pidfile" ] || return 1
   read -r pidref < "$pidfile" 2>/dev/null || return 1
   case "$pidref" in
-    [0-9]*:[0-9]*) ;;
+    [0-9]*:[0-9]*)
+      /usr/bin/kill -s 0 "$pidref" >/dev/null 2>&1 || return 1
+      ;;
+    [0-9]*@[0-9]*)
+      start_time="$(pid_start_time "${pidref%%@*}")" || return 1
+      [ "${pidref#*@}" = "$start_time" ] || return 1
+      pidref="${pidref%%@*}"
+      ;;
     *) return 1 ;;
   esac
-  /usr/bin/kill -s 0 "$pidref" >/dev/null 2>&1 || return 1
   printf '%s\n' "$pidref"
 }
 
@@ -200,8 +235,8 @@ EOF
     i=$((i + 1))
   done
   [ "${shandbox_user_pid:-}" ] || die "failed to start"
-  shandbox_root_pidref="$(getino -p "$shandbox_root_pid")" || die "failed to get shandbox root pidref"
-  shandbox_user_pidref="$(getino -p "$shandbox_user_pid")" || die "failed to get shandbox user pidref"
+  shandbox_root_pidref="$(make_pidref "$shandbox_root_pid")" || die "failed to get shandbox root pidref"
+  shandbox_user_pidref="$(make_pidref "$shandbox_user_pid")" || die "failed to get shandbox user pidref"
   echo "$shandbox_root_pidref" > "$RUN_DIR/shandbox_root_pid"
   echo "$shandbox_user_pidref" > "$RUN_DIR/shandbox_user_pid"
   log "started (pid $shandbox_user_pid)"
