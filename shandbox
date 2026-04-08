@@ -55,6 +55,15 @@ log() {
   printf '%s\n' "$*"
 }
 
+# Resolve a sandbox-side path, prepending $SB_HOME for non-absolute paths.
+resolve_sandbox_path() {
+  case "$1" in
+    ./*|../*) return 1 ;;
+    /*)       printf '%s\n' "$1" ;;
+    *)        printf '%s\n' "$SB_HOME/$1" ;;
+  esac
+}
+
 canonical_target_path() {
   # Ensure the path stays within the sandbox root, and reject /.
   local dest="$1"
@@ -303,7 +312,7 @@ cmd_add_mount() {
     mount_opts='rbind,nosuid,nodev'
     shift
   fi
-  [ $# -eq 2 ] || die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
+  [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: shandbox add-mount [--read-write] <host-path> [<sandbox-path>]"
 
   is_running || die "not running"
 
@@ -312,7 +321,11 @@ cmd_add_mount() {
   # latter, we check the canonicalised target path starts with '$CHROOT_DIR/'.
   local src dest target
   src="$(realpath -e "$1")" || die "source path does not exist: $1"
-  dest="$2"
+  if [ $# -eq 2 ]; then
+    dest="$(resolve_sandbox_path "$2")" || die "invalid sandbox path: $2"
+  else
+    dest="$(resolve_sandbox_path "$(basename "$src")")" || die "invalid sandbox path: $(basename "$src")"
+  fi
   target="$(canonical_target_path "$dest")" || die "invalid sandbox path: $dest"
 
   # Perform the requested mount in the context of 'shandbox_root'. The mount
@@ -342,11 +355,12 @@ cmd_remove_mount() {
   [ $# -eq 1 ] || die "usage: shandbox remove-mount <sandbox-path>"
   is_running || die "not running"
 
-  local target
+  local dest target
+  dest="$(resolve_sandbox_path "$1")" || die "invalid sandbox path: $1"
   require_shandbox_root_pid
-  target="$(canonical_target_path "$1")" || die "invalid sandbox path: $1"
+  target="$(canonical_target_path "$dest")" || die "invalid sandbox path: $dest"
   nsenter_shandbox_root umount "$target" || die "umount failed"
-  log "unmounted $1"
+  log "unmounted $dest"
 }
 
 cmd_list_mounts() {
