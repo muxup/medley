@@ -23,7 +23,6 @@
 # Within the sandbox, HOME is /home/sandbox. Unless you edit SANDBOX_HOME_DIR
 # below, this is /home/$youruser/sandbox.
 
-
 # Configuration options you may want to edit.
 SANDBOX_HOME_DIR="$HOME/sandbox"
 HOME_FILES_TO_MAP=".bashrc .vimrc"
@@ -149,6 +148,7 @@ ensure_running() {
 # creating the namespaces and recording the pids of the processes associated
 # with them.
 cmd_start() {
+  [ $# -eq 0 ] || die "usage: shandbox start"
   local pidref
   if pidref="$(read_pidref shandbox_user)"; then
     die "already running (pid ${pidref%%:*})"
@@ -244,6 +244,7 @@ EOF
 # Attempt to kill the 'shandbox_user' process, which should result in
 # 'shandbox_root' terminating as well.
 cmd_stop() {
+  [ $# -eq 0 ] || die "usage: shandbox stop"
   local i
   is_running || die "not running"
   require_shandbox_user_pid
@@ -255,6 +256,7 @@ cmd_stop() {
 }
 
 cmd_status() {
+  [ $# -eq 0 ] || die "usage: shandbox status"
   if ! is_running; then
     echo "stopped"
     return 1
@@ -281,9 +283,7 @@ sandbox_wd() {
 # an in-sandbox path if this can be done trivially. Environment variables are
 # not passed through.
 cmd_run() {
-  if [ $# -lt 1 ]; then
-    die "usage: shandbox run <command> [args...]"
-  fi
+  [ $# -ge 1 ] || die "usage: shandbox run <command> [args...]"
   ensure_running
   require_shandbox_user_pid
 
@@ -292,26 +292,18 @@ cmd_run() {
 }
 
 cmd_enter() {
+  [ $# -eq 0 ] || die "usage: shandbox enter"
   cmd_run /usr/bin/bash
 }
 
 # Bind-mount a host path into the running sandbox.
 cmd_add_mount() {
   local mount_opts="rbind,ro,nosuid,nodev"
-  if [ $# -lt 1 ]; then
-    die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
+  if [ $# -gt 0 ] && [ "$1" = "--read-write" ]; then
+    mount_opts='rbind,nosuid,nodev'
+    shift
   fi
-
-  case "$1" in
-    --read-write)
-      mount_opts='rbind,nosuid,nodev'
-      shift
-      ;;
-  esac
-
-  if [ "$#" -ne 2 ]; then
-    die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
-  fi
+  [ $# -eq 2 ] || die "usage: shandbox add-mount [--read-write] <host-path> <sandbox-path>"
 
   is_running || die "not running"
 
@@ -347,9 +339,7 @@ cmd_add_mount() {
 # Take the given path and try to umount it within the 'shandbox_root'
 # namespace.
 cmd_remove_mount() {
-  if [ $# -lt 1 ]; then
-    die "usage: shandbox remove-mount <sandbox-path>"
-  fi
+  [ $# -eq 1 ] || die "usage: shandbox remove-mount <sandbox-path>"
   is_running || die "not running"
 
   local target
@@ -360,12 +350,14 @@ cmd_remove_mount() {
 }
 
 cmd_list_mounts() {
+  local findmnt_args="-R /home/sandbox"
+  if [ $# -eq 1 ] && [ "$1" = "--all" ]; then
+    findmnt_args=
+  elif [ $# -ne 0 ]; then
+    die "usage: shandbox list-mounts [--all]"
+  fi
   is_running || die "not running"
   require_shandbox_user_pid
-  local findmnt_args="-R /home/sandbox"
-  if [ $# -gt 0 ] && [ "$1" = "--all" ]; then
-    findmnt_args=
-  fi
   findmnt -N "${SHANDBOX_USER_PIDREF%%:*}" -l -n -o TARGET,SOURCE $findmnt_args
 }
 
@@ -380,10 +372,10 @@ fi
 
 cmd="$1"; shift
 case "$cmd" in
-  start)        cmd_start ;;
-  stop)         cmd_stop ;;
-  status)       cmd_status ;;
-  enter)        cmd_enter ;;
+  start)        cmd_start "$@" ;;
+  stop)         cmd_stop "$@" ;;
+  status)       cmd_status "$@" ;;
+  enter)        cmd_enter "$@" ;;
   run)          cmd_run "$@" ;;
   add-mount)    cmd_add_mount "$@" ;;
   remove-mount) cmd_remove_mount "$@" ;;
