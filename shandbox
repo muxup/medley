@@ -319,9 +319,9 @@ cmd_enter() {
 
 # Bind-mount a host path into the running sandbox.
 cmd_add_mount() {
-  local mount_opts="rbind,ro,nosuid,nodev"
+  local mount_opts="rbind,ro,nosuid"
   if [ $# -gt 0 ] && [ "$1" = "--read-write" ]; then
-    mount_opts='rbind,nosuid,nodev'
+    mount_opts='rbind,nosuid'
     shift
   fi
   [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: shandbox add-mount [--read-write] <host-path> [<sandbox-path>]"
@@ -347,12 +347,12 @@ cmd_add_mount() {
   # mounting.
   require_shandbox_root_pid
   local mkdir_target="$target"
-  if [ -f "$src" ]; then
+  if [ ! -d "$src" ]; then
     mkdir_target="$(dirname "$target")"
   fi
   nsenter_shandbox_root mkdir -p "$mkdir_target" \
     || die "failed to create mount point"
-  if [ -f "$src" ]; then
+  if [ ! -d "$src" ]; then
     nsenter_shandbox_root touch "$target" \
       || die "failed to create mount point"
   fi
