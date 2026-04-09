@@ -317,6 +317,13 @@ cmd_enter() {
   cmd_run /usr/bin/bash
 }
 
+cmd_enter_root() {
+  [ $# -eq 0 ] || die "usage: shandbox enter-root"
+  ensure_running
+  require_shandbox_root_pid
+  nsenter_shandbox_root /usr/bin/bash
+}
+
 # Bind-mount a host path into the running sandbox.
 cmd_add_mount() {
   local mount_opts="rbind,ro,nosuid"
@@ -388,7 +395,7 @@ cmd_list_mounts() {
 }
 
 usage() {
-  printf 'usage: shandbox {start|stop|status|enter|run|add-mount|remove-mount|list-mounts}\n' >&2
+  printf 'usage: shandbox {start|stop|status|enter|enter-root|run|add-mount|remove-mount|list-mounts}\n' >&2
 }
 
 if [ $# -lt 1 ]; then
@@ -402,6 +409,7 @@ case "$cmd" in
   stop)         cmd_stop "$@" ;;
   status)       cmd_status "$@" ;;
   enter)        cmd_enter "$@" ;;
+  enter-root)   cmd_enter_root "$@" ;;
   run)          cmd_run "$@" ;;
   add-mount)    cmd_add_mount "$@" ;;
   remove-mount) cmd_remove_mount "$@" ;;
