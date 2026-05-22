@@ -20,30 +20,25 @@
 # perspective of within the sandbox. Other paths are from the perspective of
 # our normal unmodified filesystem layout.
 #
-# Within the sandbox, HOME is /home/sandbox. Unless you edit SANDBOX_HOME_DIR
-# below, this is /home/$youruser/sandbox.
+# Within the sandbox, HOME is /home/sandbox. On the host, the sandbox
+# directory is selected by the SANDBOX_DIR environment variable, defaulting to
+# $HOME/sandbox. All shandbox state for a given sandbox lives within
+# $SANDBOX_DIR/.shandbox_meta, which is shadowed from the guest by a tmpfs
+# overmount so it is neither visible nor writable from inside the sandbox.
 
 # Configuration options you may want to edit.
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shandbox"
-SANDBOX_HOME_DIR="$HOME/sandbox"
-INIT_HOOK="$CONFIG_DIR/init"
 SB_HOME="/home/sandbox"
 SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
 
-# Configuration options you are less likely to want to edit.
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/shandbox"
-if [ -n "$XDG_RUNTIME_DIR" ]; then
-  RUN_DIR="$XDG_RUNTIME_DIR/shandbox"
-else
-  RUN_DIR="/tmp/shandbox-$(whoami)"
-fi
-CHROOT_DIR="$DATA_DIR/root"
-LOG_FILE="$RUN_DIR/log"
+# Derived paths.
+SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox}"
+META_DIR="$SANDBOX_DIR/.shandbox_meta"
+CHROOT_DIR="$META_DIR/root"
+RUN_DIR="$META_DIR/run"
+LOG_FILE="$META_DIR/log"
+INIT_HOOK="$META_DIR/init"
 SHANDBOX_ROOT_PIDREF=
 SHANDBOX_USER_PIDREF=
-
-mkdir -p "$RUN_DIR"
-touch "$LOG_FILE"
 
 die() {
   printf "%s\n" "$*" >&2
@@ -107,7 +102,7 @@ make_pidref() {
 # still refers to a running process. For pid@start_time refs, print just the
 # pid so the result can be used directly with tools expecting a pid.
 read_pidref() {
-  local pidfile="$RUN_DIR/${1}_pid"
+  local pidfile="$META_DIR/${1}_pid"
   local pidref start_time
   [ -r "$pidfile" ] || return 1
   read -r pidref < "$pidfile" 2>/dev/null || return 1
@@ -157,14 +152,28 @@ run_init_hook() {
   [ -x "$INIT_HOOK" ] || return 0
 
   SHANDBOX_SELF="$0" \
-  CONFIG_DIR="$CONFIG_DIR" \
-  DATA_DIR="$DATA_DIR" \
-  RUN_DIR="$RUN_DIR" \
-  CHROOT_DIR="$CHROOT_DIR" \
-  SANDBOX_HOME_DIR="$SANDBOX_HOME_DIR" \
+  SANDBOX_DIR="$SANDBOX_DIR" \
   SB_HOME="$SB_HOME" \
   SB_PATH="$SB_PATH" \
   "$INIT_HOOK"
+}
+
+# Set up the .shandbox_meta layout under the given sandbox directory, creating
+# the directory itself if it does not already exist. Used by 'shandbox new'
+# and implicitly by 'shandbox start' on an uninitialised SANDBOX_DIR.
+init_sandbox_dir() {
+  local dir="$1"
+  mkdir -p "$dir/.shandbox_meta/root" "$dir/.shandbox_meta/run" \
+    || die "failed to initialise sandbox layout under $dir"
+  printf 'initialised sandbox at %s\n' "$dir"
+  printf 'to use this sandbox, set: SANDBOX_DIR=%s\n' "$dir"
+  printf 'to add an init hook, create an executable script at: %s/.shandbox_meta/init\n' "$dir"
+}
+
+cmd_new() {
+  [ $# -eq 1 ] || die "usage: shandbox new <dir>"
+  [ ! -e "$1" ] || [ -d "$1" ] || die "$1 exists and is not a directory"
+  init_sandbox_dir "$1"
 }
 
 # Start the sandbox by ensuring the necessary root layout is in place, then
@@ -177,12 +186,27 @@ cmd_start() {
     die "already running (pid ${pidref%%:*})"
   fi
 
+  # Implicitly initialise the sandbox layout if needed.
+  if [ ! -d "$META_DIR" ]; then
+    init_sandbox_dir "$SANDBOX_DIR"
+  fi
+
+  # Fresh-start housekeeping: rotate the log, clear stale pid files, the old
+  # passwd, and the contents of the in-guest /run/user bind source.
+  if [ -f "$LOG_FILE" ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.old"
+  fi
+  touch "$LOG_FILE"
+  rm -f "$META_DIR/shandbox_root_pid" "$META_DIR/shandbox_user_pid" "$META_DIR/passwd"
+  rm -rf "$RUN_DIR"
+  mkdir -p "$RUN_DIR"
+
   local sb_uid="$(id -u)"
   local sb_gid="$(id -g)"
 
   # Set up a fake /etc/passwd so the user within the sandbox appears as
   # 'sandbox'.
-  cat - <<EOF > "$RUN_DIR/passwd"
+  cat - <<EOF > "$META_DIR/passwd"
 root:x:0:0::/root:/usr/bin/nologin
 nobody:x:65534:65534::/:/usr/bin/nologin
 sandbox:x:$sb_uid:$sb_gid::/home/sandbox:/usr/bin/bash
@@ -197,16 +221,16 @@ EOF
   # necessary mkdir/touch just before the mount, within the script passed to
   # 'unshare'.
   CHROOT_DIR="$CHROOT_DIR" \
-  SANDBOX_HOME_DIR="$SANDBOX_HOME_DIR" \
+  SANDBOX_DIR="$SANDBOX_DIR" \
+  META_DIR="$META_DIR" \
+  RUN_DIR="$RUN_DIR" \
   SB_UID="$sb_uid" \
   SB_GID="$sb_gid" \
-  RUN_DIR="$RUN_DIR" \
   SB_HOME="$SB_HOME" \
   SB_PATH="$SB_PATH" \
   unshare --mount --ipc --pid --user --fork --kill-child --map-root-user -- \
     /bin/sh <<'EOF' &
 set -eu
-mkdir -p "$CHROOT_DIR" "$SANDBOX_HOME_DIR" "$RUN_DIR/run"
 mount --make-rprivate /
 mount --bind "$CHROOT_DIR" "$CHROOT_DIR"
 for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve; do
@@ -214,9 +238,9 @@ for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve;
   mkdir -p "$CHROOT_DIR$p"
   mount -o rbind,ro,nosuid,nodev "$p" "$CHROOT_DIR$p"
 done
-mount -o bind,ro "$RUN_DIR/passwd" "$CHROOT_DIR/etc/passwd"
+mount -o bind,ro "$META_DIR/passwd" "$CHROOT_DIR/etc/passwd"
 mkdir -p "$CHROOT_DIR/run/user/$SB_UID"
-mount -o bind,nosuid,nodev "$RUN_DIR/run" "$CHROOT_DIR/run/user/$SB_UID"
+mount -o bind,nosuid,nodev "$RUN_DIR" "$CHROOT_DIR/run/user/$SB_UID"
 mkdir -p "$CHROOT_DIR/dev"
 mount -t tmpfs -o nosuid,noexec,mode=0755,size=64k tmpfs "$CHROOT_DIR/dev"
 for d in null zero full random urandom tty; do
@@ -234,7 +258,11 @@ ln -sf /proc/self/fd/2 "$CHROOT_DIR/dev/stderr"
 mkdir -p "$CHROOT_DIR/tmp"
 mount -o rbind,nosuid,nodev /tmp "$CHROOT_DIR/tmp"
 mkdir -p "$CHROOT_DIR/home/sandbox"
-mount -o bind,nosuid,nodev "$SANDBOX_HOME_DIR" "$CHROOT_DIR/home/sandbox"
+mount -o bind,nosuid,nodev "$SANDBOX_DIR" "$CHROOT_DIR/home/sandbox"
+# Shadow the host-side .shandbox_meta directory from the guest with an empty,
+# unreadable tmpfs so the guest can't see or tamper with sandbox state.
+mount -t tmpfs -o nosuid,noexec,nodev,size=4k,mode=0,nr_inodes=1 tmpfs \
+  "$CHROOT_DIR/home/sandbox/.shandbox_meta"
 mkdir -p "$CHROOT_DIR/proc"
 mount -t proc proc "$CHROOT_DIR/proc"
 env -i HOME="$SB_HOME" PATH="$SB_PATH" TERM="${TERM:-xterm}" XDG_RUNTIME_DIR="/run/user/$SB_UID" \
@@ -259,8 +287,8 @@ EOF
   [ "$shandbox_user_pid" ] || die "failed to start"
   shandbox_root_pidref="$(make_pidref "$shandbox_root_pid")" || die "failed to get shandbox root pidref"
   shandbox_user_pidref="$(make_pidref "$shandbox_user_pid")" || die "failed to get shandbox user pidref"
-  echo "$shandbox_root_pidref" > "$RUN_DIR/shandbox_root_pid"
-  echo "$shandbox_user_pidref" > "$RUN_DIR/shandbox_user_pid"
+  echo "$shandbox_root_pidref" > "$META_DIR/shandbox_root_pid"
+  echo "$shandbox_user_pidref" > "$META_DIR/shandbox_user_pid"
   log "started (pid $shandbox_user_pid)"
   if ! run_init_hook; then
     cmd_stop >/dev/null 2>&1 || true
@@ -278,7 +306,7 @@ cmd_stop() {
   /usr/bin/kill "$SHANDBOX_USER_PIDREF" 2>/dev/null || true
   i=0
   while [ "$i" -lt 20 ] && is_running; do sleep 0.1; i=$((i + 1)); done
-  rm -f "$RUN_DIR/shandbox_root_pid" "$RUN_DIR/shandbox_user_pid"
+  rm -f "$META_DIR/shandbox_root_pid" "$META_DIR/shandbox_user_pid"
   log "stopped"
 }
 
@@ -299,9 +327,9 @@ cmd_status() {
 # the path is within the sandbox home).
 sandbox_wd() {
   case "$PWD" in
-    "$SANDBOX_HOME_DIR"/*) echo "$SB_HOME${PWD#"$SANDBOX_HOME_DIR"}" ;;
-    "$SANDBOX_HOME_DIR")   echo "$SB_HOME" ;;
-    *)                     echo "$SB_HOME" ;;
+    "$SANDBOX_DIR"/*) echo "$SB_HOME${PWD#"$SANDBOX_DIR"}" ;;
+    "$SANDBOX_DIR")   echo "$SB_HOME" ;;
+    *)                echo "$SB_HOME" ;;
   esac
 }
 
@@ -401,7 +429,7 @@ cmd_list_mounts() {
 }
 
 usage() {
-  printf 'usage: shandbox {start|stop|status|enter|enter-root|run|add-mount|remove-mount|list-mounts}\n' >&2
+  printf 'usage: shandbox {new|start|stop|status|enter|enter-root|run|add-mount|remove-mount|list-mounts}\n' >&2
 }
 
 if [ $# -lt 1 ]; then
@@ -411,6 +439,7 @@ fi
 
 cmd="$1"; shift
 case "$cmd" in
+  new)          cmd_new "$@" ;;
   start)        cmd_start "$@" ;;
   stop)         cmd_stop "$@" ;;
   status)       cmd_status "$@" ;;
