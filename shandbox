@@ -24,9 +24,9 @@
 # below, this is /home/$youruser/sandbox.
 
 # Configuration options you may want to edit.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shandbox"
 SANDBOX_HOME_DIR="$HOME/sandbox"
-HOME_FILES_TO_MAP=".bashrc .vimrc"
-HOME_DIRS_TO_MAP=".vim bin"
+INIT_HOOK="$CONFIG_DIR/init"
 SB_HOME="/home/sandbox"
 SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
 
@@ -153,6 +153,20 @@ ensure_running() {
   is_running || cmd_start
 }
 
+run_init_hook() {
+  [ -x "$INIT_HOOK" ] || return 0
+
+  SHANDBOX_SELF="$0" \
+  CONFIG_DIR="$CONFIG_DIR" \
+  DATA_DIR="$DATA_DIR" \
+  RUN_DIR="$RUN_DIR" \
+  CHROOT_DIR="$CHROOT_DIR" \
+  SANDBOX_HOME_DIR="$SANDBOX_HOME_DIR" \
+  SB_HOME="$SB_HOME" \
+  SB_PATH="$SB_PATH" \
+  "$INIT_HOOK"
+}
+
 # Start the sandbox by ensuring the necessary root layout is in place, then
 # creating the namespaces and recording the pids of the processes associated
 # with them.
@@ -187,8 +201,6 @@ EOF
   SB_UID="$sb_uid" \
   SB_GID="$sb_gid" \
   RUN_DIR="$RUN_DIR" \
-  HOME_FILES_TO_MAP="$HOME_FILES_TO_MAP" \
-  HOME_DIRS_TO_MAP="$HOME_DIRS_TO_MAP" \
   SB_HOME="$SB_HOME" \
   SB_PATH="$SB_PATH" \
   unshare --mount --ipc --pid --user --fork --kill-child --map-root-user -- \
@@ -225,16 +237,6 @@ mkdir -p "$CHROOT_DIR/home/sandbox"
 mount -o bind,nosuid,nodev "$SANDBOX_HOME_DIR" "$CHROOT_DIR/home/sandbox"
 mkdir -p "$CHROOT_DIR/proc"
 mount -t proc proc "$CHROOT_DIR/proc"
-for f in $HOME_FILES_TO_MAP; do
-  [ -f "$HOME/$f" ] || continue
-  touch "$SANDBOX_HOME_DIR/$f"
-  mount -o bind,ro,nosuid,nodev "$HOME/$f" "$CHROOT_DIR/home/sandbox/$f"
-done
-for d in $HOME_DIRS_TO_MAP; do
-  [ -d "$HOME/$d" ] || continue
-  mkdir -p "$SANDBOX_HOME_DIR/$d"
-  mount -o rbind,ro,nosuid,nodev "$HOME/$d" "$CHROOT_DIR/home/sandbox/$d"
-done
 env -i HOME="$SB_HOME" PATH="$SB_PATH" TERM="${TERM:-xterm}" XDG_RUNTIME_DIR="/run/user/$SB_UID" \
   unshare --user --map-user="$SB_UID" --map-group="$SB_GID" --root="$CHROOT_DIR" -- \
   sleep infinity &
@@ -260,6 +262,10 @@ EOF
   echo "$shandbox_root_pidref" > "$RUN_DIR/shandbox_root_pid"
   echo "$shandbox_user_pidref" > "$RUN_DIR/shandbox_user_pid"
   log "started (pid $shandbox_user_pid)"
+  if ! run_init_hook; then
+    cmd_stop >/dev/null 2>&1 || true
+    die "init hook failed: $INIT_HOOK"
+  fi
 }
 
 # Attempt to kill the 'shandbox_user' process, which should result in
