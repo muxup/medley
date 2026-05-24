@@ -323,11 +323,20 @@ cmd_status() {
   tail -20 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
 }
 
-# Translate the host PWD to an in-sandbox path if it's trivial to do so. Paths
-# within the sandbox home are rewritten in terms of $SB_HOME, and host paths
-# that are mapped directly in by default (e.g. /tmp) are used as-is. Anything
-# else falls back to $SB_HOME.
+# Determine the in-sandbox working directory to use for 'enter' and 'run'. If
+# SB_PWD is set in the environment it is used directly, and must be an
+# absolute sandbox-side path. Otherwise, translate the host PWD to an
+# in-sandbox path if it's trivial to do so: paths within the sandbox home are
+# rewritten in terms of $SB_HOME, and host paths that are mapped directly in
+# by default (e.g. /tmp) are used as-is. Anything else falls back to $SB_HOME.
 sandbox_wd() {
+  if [ -n "$SB_PWD" ]; then
+    case "$SB_PWD" in
+      /*) printf '%s\n' "$SB_PWD"; return ;;
+      *)  printf 'SB_PWD must be an absolute sandbox-side path: %s\n' "$SB_PWD" >&2
+          return 1 ;;
+    esac
+  fi
   case "$PWD" in
     "$SANDBOX_DIR")   echo "$SB_HOME" ;;
     "$SANDBOX_DIR"/*) echo "$SB_HOME${PWD#"$SANDBOX_DIR"}" ;;
@@ -345,8 +354,10 @@ cmd_run() {
   [ $# -ge 1 ] || die "usage: shandbox run <command> [args...]"
   ensure_running
   require_shandbox_user_pid
+  local wd
+  wd="$(sandbox_wd)" || exit 1
 
-  exec nsenter --preserve-credentials --env -U -m -i -p --root --wdns="$(sandbox_wd)" \
+  exec nsenter --preserve-credentials --env -U -m -i -p --root --wdns="$wd" \
     -t "$SHANDBOX_USER_PIDREF" -- "$@"
 }
 
