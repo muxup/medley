@@ -29,6 +29,7 @@
 # Configuration options you may want to edit.
 SB_HOME="/home/sandbox"
 SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shandbox"
 
 # Derived paths.
 SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox}"
@@ -37,6 +38,7 @@ CHROOT_DIR="$META_DIR/root"
 RUN_DIR="$META_DIR/run"
 LOG_FILE="$META_DIR/log"
 INIT_HOOK="$META_DIR/init"
+DEFAULT_INIT="$CONFIG_DIR/default-init"
 SHANDBOX_ROOT_PIDREF=
 SHANDBOX_USER_PIDREF=
 
@@ -167,7 +169,14 @@ init_sandbox_dir() {
     || die "failed to initialise sandbox layout under $dir"
   printf 'initialised sandbox at %s\n' "$dir"
   printf 'to use this sandbox, set: SANDBOX_DIR=%s\n' "$dir"
-  printf 'to add an init hook, create an executable script at: %s/.shandbox_meta/init\n' "$dir"
+  if [ -f "$DEFAULT_INIT" ]; then
+    cp "$DEFAULT_INIT" "$dir/.shandbox_meta/init" \
+      || die "failed to copy default init hook from $DEFAULT_INIT"
+    chmod +x "$dir/.shandbox_meta/init"
+    printf 'copied default init hook from %s\n' "$DEFAULT_INIT"
+  else
+    printf 'to add an init hook, create an executable script at: %s/.shandbox_meta/init\n' "$dir"
+  fi
 }
 
 cmd_new() {
