@@ -323,12 +323,16 @@ cmd_status() {
   tail -20 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
 }
 
-# Translate the host PWD to an in-sandbox path if it's trivial to do so (i.e.
-# the path is within the sandbox home).
+# Translate the host PWD to an in-sandbox path if it's trivial to do so. Paths
+# within the sandbox home are rewritten in terms of $SB_HOME, and host paths
+# that are mapped directly in by default (e.g. /tmp) are used as-is. Anything
+# else falls back to $SB_HOME.
 sandbox_wd() {
   case "$PWD" in
-    "$SANDBOX_DIR"/*) echo "$SB_HOME${PWD#"$SANDBOX_DIR"}" ;;
     "$SANDBOX_DIR")   echo "$SB_HOME" ;;
+    "$SANDBOX_DIR"/*) echo "$SB_HOME${PWD#"$SANDBOX_DIR"}" ;;
+    /tmp|/tmp/*|/usr/*|/etc/*|/opt/*|/sys/*|/bin/*|/sbin/*|/lib/*|/lib32/*|/lib64/*)
+                      echo "$PWD" ;;
     *)                echo "$SB_HOME" ;;
   esac
 }
