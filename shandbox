@@ -30,9 +30,9 @@
 SB_HOME="/home/sandbox"
 SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shandbox"
+SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox}"
 
 # Derived paths.
-SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox}"
 META_DIR="$SANDBOX_DIR/.shandbox_meta"
 CHROOT_DIR="$META_DIR/root"
 RUN_DIR="$META_DIR/run"
