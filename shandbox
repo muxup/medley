@@ -41,6 +41,14 @@ INIT_HOOK="$META_DIR/init"
 DEFAULT_INIT="$CONFIG_DIR/default-init"
 SHANDBOX_ROOT_PIDREF=
 SHANDBOX_USER_PIDREF=
+DEFAULT_SSH_CONFIG='Host ext%*
+  CanonicalizeHostname no
+  ControlMaster no
+  ControlPath ~/.ssh/sockets/%n
+  ProxyCommand /bin/false
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+'
 
 die() {
   printf "%s\n" "$*" >&2
@@ -166,9 +174,18 @@ run_init_hook() {
 init_sandbox_dir() {
   local dir="$1"
   mkdir -p "$dir/.shandbox_meta/root" "$dir/.shandbox_meta/run" \
+    "$dir/.ssh/sockets" \
     || die "failed to initialise sandbox layout under $dir"
+  chmod 700 "$dir/.ssh/sockets"
   printf 'initialised sandbox at %s\n' "$dir"
   printf 'to use this sandbox, set: SANDBOX_DIR=%s\n' "$dir"
+  if [ ! -e "$dir/.ssh/config" ]; then
+    printf '%s' "$DEFAULT_SSH_CONFIG" > "$dir/.ssh/config" \
+      || die "failed to create default ssh config (for usage with 'share-ssh') at $dir/.ssh/config"
+    chmod 700 "$dir/.ssh"
+    chmod 600 "$dir/.ssh/config"
+    printf 'created default ssh config at %s/.ssh/config\n' "$dir"
+  fi
   if [ -f "$DEFAULT_INIT" ]; then
     cp "$DEFAULT_INIT" "$dir/.shandbox_meta/init" \
       || die "failed to copy default init hook from $DEFAULT_INIT"
@@ -207,7 +224,7 @@ cmd_start() {
   fi
   touch "$LOG_FILE"
   rm -f "$META_DIR/shandbox_root_pid" "$META_DIR/shandbox_user_pid" "$META_DIR/passwd"
-  rm -rf "$RUN_DIR"
+  rm -rf "$RUN_DIR" "$META_DIR/ssh_config.d"
   mkdir -p "$RUN_DIR"
 
   local sb_uid="$(id -u)"
@@ -221,6 +238,17 @@ nobody:x:65534:65534::/:/usr/bin/nologin
 sandbox:x:$sb_uid:$sb_gid::/home/sandbox:/usr/bin/bash
 EOF
 
+  # Stage a user-owned copy of /etc/ssh/ssh_config.d for later bind-mounting
+  # over the original. OpenSSH refuses to read Included config files not owned
+  # by root or the invoking user, and inside the sandbox uid 0 appears as
+  # 'nobody'. Dereference symlinks while copying.
+  if [ -d /etc/ssh/ssh_config.d ]; then
+    mkdir -p "$META_DIR/ssh_config.d"
+    cp -RL /etc/ssh/ssh_config.d/. "$META_DIR/ssh_config.d" \
+      || die "failed to stage /etc/ssh/ssh_config.d"
+    chmod -R go-w "$META_DIR/ssh_config.d"
+  fi
+
   # Create the 'shandbox_root' sandbox which includes the shared mount
   # namespace, perform mounts, then set up the 'shandbox_user' inner namespace
   # that will be used for launching programs. We set the variables needed for
@@ -233,6 +261,7 @@ EOF
   SANDBOX_DIR="$SANDBOX_DIR" \
   META_DIR="$META_DIR" \
   RUN_DIR="$RUN_DIR" \
+  HAVE_SSH_CONFIG_D="$([ -d /etc/ssh/ssh_config.d ] && echo 1)" \
   SB_UID="$sb_uid" \
   SB_GID="$sb_gid" \
   SB_HOME="$SB_HOME" \
@@ -248,6 +277,9 @@ for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve;
   mount -o rbind,ro,nosuid,nodev "$p" "$CHROOT_DIR$p"
 done
 mount -o bind,ro "$META_DIR/passwd" "$CHROOT_DIR/etc/passwd"
+if [ -n "$HAVE_SSH_CONFIG_D" ]; then
+  mount -o bind,ro "$META_DIR/ssh_config.d" "$CHROOT_DIR/etc/ssh/ssh_config.d"
+fi
 mkdir -p "$CHROOT_DIR/run/user/$SB_UID"
 mount -o bind,nosuid,nodev "$RUN_DIR" "$CHROOT_DIR/run/user/$SB_UID"
 mkdir -p "$CHROOT_DIR/dev"
@@ -382,6 +414,56 @@ cmd_enter_root() {
   nsenter_shandbox_root /usr/bin/bash
 }
 
+cmd_share_ssh() {
+  [ $# -ge 2 ] || die "usage: shandbox share-ssh <socket-name> <ssh-target> [ssh args...]"
+  [ -d "$META_DIR" ] || die "sandbox is not initialised: run 'shandbox new $SANDBOX_DIR' first"
+
+  local name="$1"
+  shift
+  case "$name" in
+    ""|[!A-Za-z]*|*[!A-Za-z0-9_-]*)
+      die "invalid socket-name: use [A-Za-z][A-Za-z0-9_-]*"
+      ;;
+    *)
+      ;;
+  esac
+  local socket_dir="$SANDBOX_DIR/.ssh/sockets"
+  local sock="$socket_dir/ext%$name"
+  local control_path="$socket_dir/ext%%$name"
+  mkdir -p "$socket_dir" || die "failed to create socket directory: $socket_dir"
+  chmod 700 "$socket_dir" || die "failed to set socket directory permissions"
+
+  # If a socket file is already present, probe it. Error if it's active and
+  # remove it if it's stale.
+  if [ -e "$sock" ]; then
+    if ssh -O check -o ControlPath="$control_path" dummy-host-argument 2>/dev/null; then
+      die "ssh master already running at $sock"
+    fi
+    printf 'shandbox share-ssh: removing stale socket %s\n' "$sock" >&2
+    rm -f "$sock"
+  fi
+
+  cleanup_share_ssh() {
+    if [ -e "$sock" ]; then
+      printf 'shandbox share-ssh: removing socket %s\n' "$sock" >&2
+      rm -f "$sock"
+    fi
+  }
+  trap cleanup_share_ssh EXIT HUP INT TERM
+
+  local note_one="echo shandbox share-ssh: connected"
+  local note_two="echo shandbox share-ssh: from inside the sandbox, use ssh ext%%$name"
+  printf 'shandbox share-ssh: connecting (%s) using %s\n' "$1" "$sock"
+  ssh -N -M \
+    -o ControlPersist=no \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o PermitLocalCommand=yes \
+    -o "LocalCommand=$note_one; $note_two" \
+    -o ControlPath="$control_path" \
+    "$@"
+}
+
 # Bind-mount a host path into the running sandbox.
 cmd_add_mount() {
   local mount_opts="rbind,ro,nosuid"
@@ -453,7 +535,7 @@ cmd_list_mounts() {
 }
 
 usage() {
-  printf 'usage: shandbox {new|start|stop|status|enter|enter-root|run|add-mount|remove-mount|list-mounts}\n' >&2
+  printf 'usage: shandbox {new|start|stop|status|enter|enter-root|run|share-ssh|add-mount|remove-mount|list-mounts}\n' >&2
 }
 
 if [ $# -lt 1 ]; then
@@ -470,6 +552,7 @@ case "$cmd" in
   enter)        cmd_enter "$@" ;;
   enter-root)   cmd_enter_root "$@" ;;
   run)          cmd_run "$@" ;;
+  share-ssh)    cmd_share_ssh "$@" ;;
   add-mount)    cmd_add_mount "$@" ;;
   remove-mount) cmd_remove_mount "$@" ;;
   list-mounts)  cmd_list_mounts "$@" ;;
