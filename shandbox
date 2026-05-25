@@ -55,6 +55,11 @@ die() {
   exit 1
 }
 
+case "$SANDBOX_DIR" in
+  /*) ;;
+  *) die "SANDBOX_DIR must be an absolute path: $SANDBOX_DIR" ;;
+esac
+
 log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
   printf '%s\n' "$*"
@@ -178,7 +183,7 @@ init_sandbox_dir() {
     || die "failed to initialise sandbox layout under $dir"
   chmod 700 "$dir/.ssh/sockets"
   printf 'initialised sandbox at %s\n' "$dir"
-  printf 'to use this sandbox, set: SANDBOX_DIR=%s\n' "$dir"
+  printf 'to use this sandbox, set: export SANDBOX_DIR=%s\n' "$dir"
   if [ ! -e "$dir/.ssh/config" ]; then
     printf '%s' "$DEFAULT_SSH_CONFIG" > "$dir/.ssh/config" \
       || die "failed to create default ssh config (for usage with 'share-ssh') at $dir/.ssh/config"
@@ -199,7 +204,7 @@ init_sandbox_dir() {
 cmd_new() {
   [ $# -eq 1 ] || die "usage: shandbox new <dir>"
   [ ! -e "$1" ] || [ -d "$1" ] || die "$1 exists and is not a directory"
-  init_sandbox_dir "$1"
+  init_sandbox_dir "$(realpath -m "$1")"
 }
 
 # Start the sandbox by ensuring the necessary root layout is in place, then
