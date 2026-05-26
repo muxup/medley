@@ -165,7 +165,15 @@ ensure_running() {
 }
 
 run_init_hook() {
-  [ -x "$INIT_HOOK" ] || return 0
+  [ -e "$INIT_HOOK" ] || return 0
+  if ! [ -f "$INIT_HOOK" ]; then
+    printf 'init hook is not a regular file: %s\n' "$INIT_HOOK" >&2
+    return 0
+  fi
+  if ! [ -x "$INIT_HOOK" ]; then
+    printf 'init hook is not executable: %s\n' "$INIT_HOOK" >&2
+    return 0
+  fi
 
   SHANDBOX_SELF="$0" \
   SANDBOX_DIR="$SANDBOX_DIR" \
