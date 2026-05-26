@@ -30,7 +30,8 @@
 SB_HOME="/home/sandbox"
 SB_PATH="$SB_HOME/.local/bin:$SB_HOME/bin:/usr/local/bin:/usr/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shandbox"
-SANDBOX_DIR="${SANDBOX_DIR:-$HOME/sandbox}"
+DEFAULT_SANDBOX_DIR="$HOME/sandbox"
+SANDBOX_DIR="${SANDBOX_DIR:-$DEFAULT_SANDBOX_DIR}"
 
 # Derived paths.
 META_DIR="$SANDBOX_DIR/.shandbox_meta"
@@ -183,7 +184,9 @@ init_sandbox_dir() {
     || die "failed to initialise sandbox layout under $dir"
   chmod 700 "$dir/.ssh/sockets"
   printf 'initialised sandbox at %s\n' "$dir"
-  printf 'to use this sandbox, set: export SANDBOX_DIR=%s\n' "$dir"
+  if [ "$dir" != "$DEFAULT_SANDBOX_DIR" ]; then
+    printf 'to use this sandbox, set: export SANDBOX_DIR=%s\n' "$dir"
+  fi
   if [ ! -e "$dir/.ssh/config" ]; then
     printf '%s' "$DEFAULT_SSH_CONFIG" > "$dir/.ssh/config" \
       || die "failed to create default ssh config (for usage with 'share-ssh') at $dir/.ssh/config"
