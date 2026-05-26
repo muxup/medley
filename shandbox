@@ -165,7 +165,11 @@ ensure_running() {
 }
 
 run_init_hook() {
-  [ -x "$INIT_HOOK" ] || return 0
+  [ -f "$INIT_HOOK" ] || return 0
+  if ! [ -x "$INIT_HOOK" ]; then
+      echo "$INIT_HOOK is not executable. Intentional?"
+      return 0
+  fi
 
   SHANDBOX_SELF="$0" \
   SANDBOX_DIR="$SANDBOX_DIR" \
