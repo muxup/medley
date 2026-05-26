@@ -506,11 +506,13 @@ cmd_share_ssh() {
 # Bind-mount a host path into the running sandbox.
 cmd_add_mount() {
   local mount_opts="rbind,ro,nosuid"
-  if [ $# -gt 0 ] && [ "$1" = "--read-write" ]; then
-    mount_opts='rbind,nosuid'
-    shift
-  fi
-  [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: shandbox add-mount [--read-write] <host-path> [<sandbox-path>]"
+  case "${1:-}" in
+    --read-write|--rw|--readwrite)
+      mount_opts='rbind,nosuid'
+      shift
+      ;;
+  esac
+  [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: shandbox add-mount [--read-write|--rw] <host-path> [<sandbox-path>]"
 
   is_running || die "not running"
 
