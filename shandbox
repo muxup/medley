@@ -279,10 +279,33 @@ EOF
 set -eu
 mount --make-rprivate /
 mount --bind "$CHROOT_DIR" "$CHROOT_DIR"
+HAVE_FD_BASED_MOUNT=
+if mount --version | grep -q 'fd-based-mount'; then
+  HAVE_FD_BASED_MOUNT=1
+fi
+
+readonly_rbind() {
+  # We want a recursive bind, and on systems with fd-based-mount we can also
+  # ask the kernel to apply ro/nosuid/nodev recursively.  But on util-linux
+  # builds that lack fd-based-mount (including Ubuntu 26.04), the fallback
+  # path first attaches the recursive bind, then tries to remount every copied
+  # submount with new flags. That remount is rejected because, in an
+  # unprivileged mount namespace, the kernel doesn't let us change flags on
+  # host submounts copied from a more privileged namespace. To avoid this
+  # issue, when lacking fd-based-mount we keep the recursive bind but only
+  # change flags on the top-level bind mount.
+  if [ -n "$HAVE_FD_BASED_MOUNT" ]; then
+    mount -o rbind,ro=recursive,nosuid=recursive,nodev=recursive "$1" "$2"
+    return
+  fi
+  mount -o rbind "$1" "$2"
+  mount -o remount,bind,ro,nosuid,nodev "$2"
+}
+
 for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve; do
   [ -e "$p" ] || continue
   mkdir -p "$CHROOT_DIR$p"
-  mount -o rbind,ro,nosuid,nodev "$p" "$CHROOT_DIR$p"
+  readonly_rbind "$p" "$CHROOT_DIR$p"
 done
 mount -o bind,ro "$META_DIR/passwd" "$CHROOT_DIR/etc/passwd"
 if [ -n "$HAVE_SSH_CONFIG_D" ]; then
