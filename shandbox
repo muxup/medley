@@ -139,7 +139,7 @@ read_pidref() {
 # Get the pid of the first child, returning non-zero on failure.
 find_child() {
   local child
-  read -r child _ < "/proc/$1/task/$1/children" 2>/dev/null || true
+  { read -r child _ < "/proc/$1/task/$1/children" || true; } 2>/dev/null
   [ -n "$child" ] && echo "$child"
 }
 
