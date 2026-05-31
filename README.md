@@ -6,6 +6,11 @@ This repository contains small helper scripts or utilities that don't seem to
 merit their own repository, but probably deserve a better home than a
 throwaway Gist.
 
+# at-agent
+
+Script to aid the human->agent feedback loop via inline comments. Written up
+[in a minipost](https://muxup.com/2026q2/minipost-at-agent).
+
 # shandbox
 
 A simple sandbox setup using `unshare` and `nsenter`, that will set up a

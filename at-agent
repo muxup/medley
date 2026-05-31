@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+LINES_OF_CONTEXT = 3
+# Match punctuation prefix, @agent, optional !, then text.
+AGENT_LINE = re.compile(r"^(\s*[^A-Za-z0-9\s]{2,}\s+)@agent(!?)(.*)$")
+
+
+HEADER = """The user manually added these annotations for you, the agent, to react to.
+They are either comment/explanation requests, which ask you to explain nearby
+code or answer the user's question without editing files, or action requests,
+which ask you to investigate and make the requested code change.
+"""
+
+
+# Treat files containing NUL bytes near the start as binary.
+def is_binary_file(path):
+    try:
+        with path.open("rb") as f:
+            return b"\0" in f.read(8192)
+    except OSError as e:
+        print(f"warning: could not read {path}: {e}", file=sys.stderr)
+        return True
+
+
+# Return the per-user state directory, creating it when needed.
+def state_dir():
+    root = os.environ.get("XDG_STATE_HOME")
+    directory = (
+        Path(root) / "at-agent" if root else Path.home() / ".local/state/at-agent"
+    )
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory
+
+
+# Read the editor-written set of candidate inodes.
+def read_inode_queue():
+    path = state_dir() / "inodes"
+    try:
+        text = path.read_text()
+        inodes = {int(line.strip()) for line in text.splitlines() if line.strip()}
+        return path, text, inodes
+    except FileNotFoundError:
+        print(f"warning: inode list not found: {path}", file=sys.stderr)
+    except (OSError, ValueError) as e:
+        print(f"warning: could not read inode list {path}: {e}", file=sys.stderr)
+    return path, "", set()
+
+
+# Find if any of the flagged inodes are present within the current directory
+# tree.
+def inode_paths(queue):
+    _, _, inodes = queue
+    wanted = set(inodes)
+    found = set()
+    paths = []
+    stack = [Path.cwd()]
+    while wanted and stack:
+        directory = stack.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        inode = entry.inode()
+                        if inode not in wanted:
+                            continue
+                        paths.append(Path(entry.path))
+                        found.add(inode)
+                        wanted.remove(inode)
+                except OSError:
+                    pass
+    return paths, found
+
+
+# Remove consumed inodes, unless the editor changed the queue after we read it.
+def consume_inode_queue(queue, found):
+    if not found:
+        return
+    path, original_text, _ = queue
+    try:
+        current_text = path.read_text()
+    except OSError as e:
+        print(f"warning: could not read inode list {path}: {e}", file=sys.stderr)
+        return
+    if current_text != original_text:
+        print(
+            f"warning: inode list changed during run, not rewriting: {path}",
+            file=sys.stderr,
+        )
+        return
+
+    lines = [
+        line
+        for line in original_text.splitlines()
+        if line.strip() and int(line.strip()) not in found
+    ]
+    path.write_text("".join(f"{line}\n" for line in lines))
+
+
+# Find candidate files by scanning the current tree with ripgrep.
+def rg_paths():
+    try:
+        result = subprocess.run(
+            [
+                "rg",
+                "-l",
+                r"^\s*[^[:alnum:][:space:]]{2,}\s+@agent!?(?:\s|$)",
+                ".",
+            ],
+            text=True,
+            capture_output=True,
+        )
+    except OSError as e:
+        print(f"warning: could not run rg: {e}", file=sys.stderr)
+        return []
+    if result.returncode == 1:
+        return []
+    if result.returncode:
+        print(f"warning: rg failed: {result.stderr.strip()}", file=sys.stderr)
+        return []
+    return [Path(line) for line in result.stdout.splitlines()]
+
+
+# Parse a whole-line @agent marker, returning the constituent groups.
+def parse_marker(line):
+    m = AGENT_LINE.match(line)
+    if not m:
+        return None
+    prefix, bang, rest = m.groups()
+    if rest and not rest[0].isspace():
+        return None
+    return prefix, bool(bang), rest.strip()
+
+
+# Return continuation text when a following comment line shares the marker prefix.
+def continuation(line, prefix):
+    if not line.startswith(prefix) or parse_marker(line):
+        return None
+    text = line[len(prefix) :]
+    return text if text.strip() else None
+
+
+# Return candidate paths found by explicit args, rg, or matching queued inodes.
+def discover_paths(args, parser):
+    mode = args.discover or ("args" if args.files else "inodes")
+    if mode == "args":
+        if not args.files:
+            parser.error("--discover=args requires file arguments")
+        return [Path(p) for p in args.files], None, set()
+    if args.files:
+        parser.error(f"--discover={mode} does not accept file arguments")
+    if mode == "rg":
+        return rg_paths(), None, set()
+    if mode == "inodes":
+        queue = read_inode_queue()
+        paths, found = inode_paths(queue)
+        return paths, queue, found
+    parser.error(f"unknown discovery mode: {mode}")
+
+
+# Remove @agent markers, returning whether the file was read and any
+# directives. Skip files we heuristically determine as being binary.
+def process(path, dry_run):
+    if is_binary_file(path):
+        return False, []
+    try:
+        file_text = path.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError as e:
+        print(f"warning: could not read {path}: {e}", file=sys.stderr)
+        return False, []
+    lines = file_text.split("\n")
+
+    clean_lines = []
+    remarks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        marker = parse_marker(line)
+        if not marker:
+            clean_lines.append(line)
+            i += 1
+            continue
+
+        marker_line = i
+        prefix, bang, request = marker
+        remark_text = [f"@agent{'!' if bang else ''} {request or '(no text)'}"]
+        i += 1
+        while i < len(lines) and (cont := continuation(lines[i], prefix)) is not None:
+            remark_text.append(cont)
+            i += 1
+
+        ctx = lines[
+            max(0, marker_line - LINES_OF_CONTEXT) : marker_line + 1 + LINES_OF_CONTEXT
+        ]
+        if ctx and ctx[-1] == "" and file_text.endswith("\n"):
+            ctx = ctx[:-1]
+        remarks.append(
+            {
+                "file": str(path),
+                # clean_lines contains every retained line before this marker,
+                # so the next retained line is the same position the marker had
+                # in the cleaned file. Context still comes from the original file.
+                "line": len(clean_lines) + 1,
+                "kind": "action request" if bang else "comment/explanation request",
+                "text": remark_text,
+                "context": ctx,
+                "lang": path.suffix[1:] or "text",
+            }
+        )
+
+    if remarks and not dry_run:
+        path.write_text(
+            "\n".join(clean_lines), encoding="utf-8", errors="surrogateescape"
+        )
+    return True, remarks
+
+
+# Produce agent-facing report in standard format.
+def build_report(remarks, dry_run):
+    lines = [HEADER]
+    if dry_run:
+        lines.append(
+            "Dry run: @agent remark lines were not removed from the working tree."
+        )
+    else:
+        lines.append(
+            "The @agent remark lines have already been removed from the working tree."
+        )
+    lines += ["Relevant line numbers refer to the files after remark removal.", ""]
+
+    for i, r in enumerate(remarks, 1):
+        lines += [
+            f"{i}. {r['file']}",
+            f"   kind: {r['kind']}",
+            f"   relevant line number: {r['line']}",
+            "   text:",
+        ]
+        lines += [f"     {line}" for line in r["text"]]
+        lines += ["   nearby context before removal:"]
+        lines += [f"     {line}" for line in r["context"]]
+        lines += [""]
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="relay and remove @agent annotations")
+    parser.add_argument(
+        "--discover",
+        choices=["inodes", "args", "rg"],
+        help="choose files from state inodes, arguments, or rg",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="report remarks without editing files"
+    )
+    parser.add_argument("files", nargs="*")
+    args = parser.parse_args()
+
+    paths, inode_queue, found_inodes = discover_paths(args, parser)
+    remarks = []
+    processed_inodes = set()
+    for path in paths:
+        processed, path_remarks = process(path, args.dry_run)
+        remarks.extend(path_remarks)
+        if processed and inode_queue is not None:
+            processed_inodes.add(path.stat().st_ino)
+
+    if inode_queue is not None and not args.dry_run:
+        consume_inode_queue(inode_queue, found_inodes & processed_inodes)
+
+    if not remarks:
+        print("No @agent remarks found.")
+        return
+
+    report = build_report(remarks, args.dry_run)
+    name = datetime.now().strftime("report-%Y%m%d-%H%M%S") + f"-{os.getpid()}.txt"
+    path = state_dir() / name
+    path.write_text(report + "\n", encoding="utf-8", errors="surrogateescape")
+    print(report)
+    print(f"Report also written to: {path}")
+
+
+if __name__ == "__main__":
+    main()
