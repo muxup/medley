@@ -492,8 +492,16 @@ cmd_share_ssh() {
 
   local note_one="echo shandbox share-ssh: connected"
   local note_two="echo shandbox share-ssh: from inside the sandbox, use ssh ext%%$name"
+  local ssh_cmd="ssh"
   printf 'shandbox share-ssh: connecting (%s) using %s\n' "$1" "$sock"
-  ssh -N -M \
+  if command -v autossh >/dev/null 2>&1; then
+    ssh_cmd="autossh -M 0"
+    export AUTOSSH_GATETIME=10
+  else
+    printf 'shandbox share-ssh: autossh not found; auto-reconnect disabled\n' >&2
+  fi
+  $ssh_cmd -N \
+    -o ControlMaster=yes \
     -o ControlPersist=no \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
