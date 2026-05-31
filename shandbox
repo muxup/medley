@@ -514,9 +514,11 @@ cmd_share_ssh() {
 # Bind-mount a host path into the running sandbox.
 cmd_add_mount() {
   local mount_opts="rbind,ro,nosuid"
+  local read_write=
   case "${1:-}" in
     --read-write|--rw|--readwrite)
       mount_opts='rbind,nosuid'
+      read_write=1
       shift
       ;;
   esac
@@ -549,6 +551,12 @@ cmd_add_mount() {
   nsenter_shandbox_root mkdir -p "$mkdir_target" \
     || die "failed to create mount point"
   if [ ! -d "$src" ]; then
+    if [ -n "$read_write" ]; then
+      printf '%s%s%s\n' \
+        "warning: read-write non-directory mounts probably don't do what you want. " \
+        "They only share in-place writes and editors often save by " \
+        "replacing files, which can fail or leave one side seeing the old file." >&2
+    fi
     nsenter_shandbox_root touch "$target" \
       || die "failed to create mount point"
   fi
