@@ -155,6 +155,10 @@ nsenter_shandbox_root() {
   nsenter --preserve-credentials -U -m -i -p -t "$SHANDBOX_ROOT_PIDREF" -- "$@"
 }
 
+nsenter_shandbox_user() {
+  nsenter --preserve-credentials -U -m -i -p --root -t "$SHANDBOX_USER_PIDREF" -- "$@"
+}
+
 is_running() {
   read_pidref shandbox_user >/dev/null 2>&1
 }
@@ -310,7 +314,7 @@ readonly_rbind() {
   mount -o remount,bind,ro,nosuid,nodev "$2"
 }
 
-for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve; do
+for p in /bin /sbin /lib /lib64 /lib32 /usr /etc /opt /sys /run/systemd/resolve /mnt/wsl; do
   [ -e "$p" ] || continue
   mkdir -p "$CHROOT_DIR$p"
   readonly_rbind "$p" "$CHROOT_DIR$p"
@@ -370,6 +374,10 @@ EOF
   echo "$shandbox_root_pidref" > "$META_DIR/shandbox_root_pid"
   echo "$shandbox_user_pidref" > "$META_DIR/shandbox_user_pid"
   log "started (pid $shandbox_user_pid)"
+  require_shandbox_user_pid
+  if ! nsenter_shandbox_user test -r /etc/resolv.conf 2>/dev/null; then
+    printf 'warning: /etc/resolv.conf is not readable inside the sandbox; DNS will likely fail\n' >&2
+  fi
   if ! run_init_hook; then
     cmd_stop >/dev/null 2>&1 || true
     die "init hook failed: $INIT_HOOK"
