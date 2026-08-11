@@ -344,8 +344,8 @@ mount -o rbind,nosuid,nodev /tmp "$CHROOT_DIR/tmp"
 mkdir -p "$CHROOT_DIR/home/sandbox"
 mount -o bind,nosuid,nodev "$SANDBOX_DIR" "$CHROOT_DIR/home/sandbox"
 # Shadow the host-side .shandbox_meta directory from the guest with an empty,
-# unreadable tmpfs so the guest can't see or tamper with sandbox state.
-mount -t tmpfs -o nosuid,noexec,nodev,size=4k,mode=0,nr_inodes=1 tmpfs \
+# read-only tmpfs so no sandbox state can be seen or tampered with.
+mount -t tmpfs -o ro,nosuid,noexec,nodev,size=4k,mode=0555,nr_inodes=1 tmpfs \
   "$CHROOT_DIR/home/sandbox/.shandbox_meta"
 mkdir -p "$CHROOT_DIR/proc"
 mount -t proc proc "$CHROOT_DIR/proc"
