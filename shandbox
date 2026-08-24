@@ -375,12 +375,12 @@ EOF
   echo "$shandbox_user_pidref" > "$META_DIR/shandbox_user_pid"
   log "started (pid $shandbox_user_pid)"
   require_shandbox_user_pid
-  if ! nsenter_shandbox_user test -r /etc/resolv.conf 2>/dev/null; then
-    printf 'warning: /etc/resolv.conf is not readable inside the sandbox; DNS will likely fail\n' >&2
-  fi
   if ! run_init_hook; then
     cmd_stop >/dev/null 2>&1 || true
     die "init hook failed: $INIT_HOOK"
+  fi
+  if ! nsenter_shandbox_user test -r /etc/resolv.conf 2>/dev/null; then
+    printf 'warning: /etc/resolv.conf is not readable inside the sandbox; DNS will likely fail\n' >&2
   fi
 }
 
