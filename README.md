@@ -89,6 +89,14 @@ See the [accompanying blog
 post](https://muxup.com/2024q4/rootless-cross-architecture-debootstrap) for
 more information.
 
+## todo
+
+A minimal todo-list manager with tasks stored in plain text. Use `todo` to add
+a task, `todone` to mark it completed. The intent is to emulate the process of
+jotting down tasks and crossing them out you might do on paper, so although
+tasks can be grouped under a section or given tags there isn't any real
+support for anything fancy beyond that.
+
 ## License
 
 The [MIT-0 license](https://github.com/muxup/medley/blob/main/LICENSE).

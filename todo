@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+TODO_FILE = Path.home() / "workpad/ongoing/todo"
+TODONE_FILE = Path.home() / "workpad/ongoing/todone"
+
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
+BACKLOG_HEADING = "Backlog:"
+
+
+@dataclass
+class Task:
+    description: str
+    tags: list[str]
+    completed_at: datetime | None = None
+
+
+@dataclass
+class TodoSection:
+    # None for the unsorted tasks before the first heading.
+    heading: str | None
+    tasks: list[Task]
+
+
+def format_description_and_tags(task: Task) -> str:
+    """Format the description followed by any tags in brackets."""
+    if task.tags:
+        return f"{task.description} [{' '.join(task.tags)}]"
+    return task.description
+
+
+def format_task_for_file(task: Task) -> str:
+    """Format the task as a line of the todo or todone file."""
+    description_and_tags = format_description_and_tags(task)
+    if task.completed_at is None:
+        return f"TODO {description_and_tags}"
+    return f"DONE {description_and_tags} ({task.completed_at:{TIMESTAMP_FORMAT}})"
+
+
+def format_task_for_display(task: Task) -> str:
+    """Format the task for terminal listing, struck through if done."""
+    description_and_tags = format_description_and_tags(task)
+    if task.completed_at is None:
+        return f"• {description_and_tags}"
+    timestamp = f"{task.completed_at:{TIMESTAMP_FORMAT}}"
+    return f"• \033[9m{description_and_tags} ({timestamp})\033[29m"
+
+
+def split_tags(parts: list[str], line_number: int = -1) -> tuple[str, list[str]]:
+    """Separate the @tags from the other words, returning (text, tags).
+
+    line_number is the line being parsed when the parts come from a file, or
+    -1 when they come from the command line.
+    """
+    joined = " ".join(parts)
+    if "[" in joined or "]" in joined:
+        sys.exit(
+            "square brackets are reserved for tags"
+            if line_number == -1
+            else f"invalid task on line {line_number}"
+        )
+    words = joined.split()
+    tags = [word for word in words if word.startswith("@")]
+    text = " ".join(word for word in words if not word.startswith("@"))
+    for tag, count in Counter(tags).items():
+        if count > 1:
+            sys.exit(
+                f"duplicate tag: {tag}"
+                if line_number == -1
+                else f"invalid task on line {line_number}"
+            )
+    return text, tags
+
+
+def parse_task(line: str, line_number: int) -> Task:
+    """Parse a task from a line of the todo or todone file.
+
+    A line is only valid if it is exactly what todo would have written for
+    its description and tags.
+    """
+    kind, _, body = line.partition(" ")
+    completed_at = None
+    if kind == "DONE":
+        body, _, timestamp = body.rpartition(" (")
+        try:
+            completed_at = datetime.strptime(
+                timestamp.removesuffix(")"), TIMESTAMP_FORMAT
+            )
+        except ValueError:
+            sys.exit(f"invalid task on line {line_number}")
+    description, _, tag_text = body.partition(" [")
+    description, tags = split_tags(
+        [description, tag_text.removesuffix("]")], line_number
+    )
+    task = Task(description, tags, completed_at)
+    if not description or format_task_for_file(task) != line:
+        sys.exit(f"invalid task on line {line_number}")
+    return task
+
+
+def read_todo_file() -> list[TodoSection]:
+    """Read the todo file's tasks, grouped under their headings.
+
+    Lines starting TODO or DONE are tasks, blank lines are ignored, and any
+    other line is a heading, which is given a trailing colon if it lacks one.
+    """
+    sections = [TodoSection(None, [])]
+    for line_number, line in enumerate(TODO_FILE.read_text().splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith(("TODO", "DONE")):
+            sections[-1].tasks.append(parse_task(line, line_number))
+        elif stripped:
+            heading = stripped if stripped.endswith(":") else stripped + ":"
+            if any(section.heading == heading for section in sections):
+                sys.exit(f"duplicate heading on line {line_number}")
+            sections.append(TodoSection(heading, []))
+    return sections
+
+
+def write_todo_file(sections: list[TodoSection]) -> None:
+    """Write the sections back out, with a blank line before each heading."""
+    lines: list[str] = []
+    for section in sections:
+        if section.heading is not None:
+            if lines:
+                lines.append("")
+            lines.append(section.heading)
+        lines.extend(format_task_for_file(task) for task in section.tasks)
+    # Resolve symlinks so that the replace updates their target.
+    path = TODO_FILE.resolve()
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text("".join(line + "\n" for line in lines))
+    os.replace(temporary, path)
+
+
+def read_todone_file() -> list[Task]:
+    lines = TODONE_FILE.read_text().splitlines()
+    return [parse_task(line, line_number) for line_number, line in enumerate(lines, 1)]
+
+
+def append_to_todone_file(task: Task) -> None:
+    with TODONE_FILE.open("a") as f:
+        f.write(format_task_for_file(task) + "\n")
+
+
+def has_tags(task: Task, tags: list[str]) -> bool:
+    return all(tag in task.tags for tag in tags)
+
+
+def todo_add(description: str, tags: list[str]) -> None:
+    """Add a task to the end of the unsorted tasks."""
+    sections = read_todo_file()
+    sections[0].tasks.append(Task(description, tags))
+    write_todo_file(sections)
+
+
+def todo_list(tags: list[str], include_backlog: bool, limit: int | None) -> None:
+    """Print the tasks carrying all the tags, under their headings.
+
+    Without tags every heading is shown, otherwise only those with matching
+    tasks. Backlog tasks are only counted unless include_backlog is set. A limit
+    stops the listing after that many tasks.
+    """
+    shown = 0
+    printed = False
+    for section in read_todo_file():
+        if shown == limit:
+            break
+        matching = [task for task in section.tasks if has_tags(task, tags)]
+        if section.heading is not None:
+            if tags and not matching:
+                continue
+            if printed:
+                print()
+            print(section.heading)
+            printed = True
+        if section.heading == BACKLOG_HEADING and not include_backlog:
+            if matching:
+                print(f"({len(matching)} hidden)")
+            continue
+        for task in matching:
+            if shown == limit:
+                break
+            print(format_task_for_display(task))
+            shown += 1
+            printed = True
+
+
+def todo_list_backlog(tags: list[str]) -> None:
+    """Print the backlog tasks carrying all the tags."""
+    for section in read_todo_file():
+        if section.heading == BACKLOG_HEADING:
+            for task in section.tasks:
+                if has_tags(task, tags):
+                    print(format_task_for_display(task))
+
+
+def todo_list_tags(tags: list[str]) -> None:
+    """Print how often each tag is used by the tasks carrying all the tags."""
+    counts: Counter[str] = Counter()
+    for section in read_todo_file():
+        for task in section.tasks:
+            if has_tags(task, tags):
+                counts.update(task.tags)
+    for tag, count in counts.most_common():
+        print(f"{count:4} {tag}")
+
+
+def cmd_todo(arguments: list[str]) -> None:
+    """Add a task if given task text, otherwise list tasks matching the tags."""
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="Add tasks, or list tasks matching @tags.",
+        epilog="A leading -N (such as -3) is shorthand for -n N.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "-a", dest="include_backlog", action="store_true", help="include the backlog"
+    )
+    mode.add_argument(
+        "-b", dest="only_backlog", action="store_true", help="show only the backlog"
+    )
+    mode.add_argument("-t", dest="list_tags", action="store_true", help="count tags")
+    mode.add_argument(
+        "-n", dest="limit", type=int, metavar="N", help="show the first N tasks"
+    )
+    parser.add_argument(
+        "words", nargs=argparse.REMAINDER, help="task text and/or @tags"
+    )
+    # argparse can't parse -N (e.g. -3) itself, so rewrite it as -n N.
+    if arguments and arguments[0].startswith("-") and arguments[0][1:].isdigit():
+        arguments = ["-n", arguments[0][1:], *arguments[1:]]
+    options = parser.parse_args(arguments)
+    if options.limit is not None and options.limit < 0:
+        parser.error("N must be nonnegative")
+    text, tags = split_tags(options.words)
+
+    if text:
+        if (
+            options.include_backlog
+            or options.only_backlog
+            or options.list_tags
+            or options.limit is not None
+        ):
+            parser.error("todo options accept tags only")
+        if text.startswith("-"):
+            parser.error("task text can't begin with -")
+        todo_add(text, tags)
+    elif options.only_backlog:
+        todo_list_backlog(tags)
+    elif options.list_tags:
+        todo_list_tags(tags)
+    else:
+        todo_list(tags, options.include_backlog, options.limit)
+
+
+def cmd_todo_edit(arguments: list[str]) -> None:
+    if arguments:
+        sys.exit("todo-edit accepts no arguments")
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    os.execvp(editor, [editor, str(TODO_FILE)])
+
+
+def cmd_todone(arguments: list[str]) -> None:
+    """Mark the open task matching the text and tags as done in the todo file
+    and append it to the todone file. Error unless exactly one task matches.
+    """
+    parser = argparse.ArgumentParser(
+        prog="todone", description="Mark the task matching the text and @tags done."
+    )
+    parser.add_argument(
+        "-b", dest="only_backlog", action="store_true", help="search only the backlog"
+    )
+    parser.add_argument(
+        "words", nargs=argparse.REMAINDER, help="task text and/or @tags"
+    )
+    options = parser.parse_args(arguments)
+    text, tags = split_tags(options.words)
+    if not text:
+        parser.error("todone requires task text")
+
+    sections = read_todo_file()
+    matching = []
+    for section in sections:
+        # With -b only the backlog is searched, otherwise everything but it.
+        in_backlog = section.heading == BACKLOG_HEADING
+        if in_backlog != options.only_backlog:
+            continue
+        for task in section.tasks:
+            if (
+                task.completed_at is None
+                and text in task.description
+                and has_tags(task, tags)
+            ):
+                matching.append(task)
+    if not matching:
+        sys.exit("no tasks matched the given text and tags")
+    if len(matching) > 1:
+        print("multiple tasks matched:", file=sys.stderr)
+        for task in matching:
+            print(format_task_for_display(task), file=sys.stderr)
+        sys.exit("use more task text or tags to select one task")
+
+    task = matching[0]
+    task.completed_at = datetime.now()
+    append_to_todone_file(task)
+    write_todo_file(sections)
+    print(format_task_for_display(task))
+
+
+def cmd_todone_archive(arguments: list[str]) -> None:
+    """Remove done tasks from the todo file, printing them. Tags can be given
+    to limit the removal only to tasks with those tags.
+    """
+    text, tags = split_tags(arguments)
+    if text:
+        sys.exit("todone-archive accepts tags only")
+    sections = read_todo_file()
+    for section in sections:
+        retained = []
+        for task in section.tasks:
+            if task.completed_at is not None and has_tags(task, tags):
+                print(format_task_for_display(task))
+            else:
+                retained.append(task)
+        section.tasks = retained
+    write_todo_file(sections)
+
+
+def page(output: str) -> None:
+    """Show output through $PAGER (default less) if stdout is a terminal."""
+    if not sys.stdout.isatty():
+        sys.stdout.write(output)
+        return
+    # As git does: F quits if it fits on one screen, R passes colour escapes
+    # through, and X leaves the output in the scrollback.
+    os.environ.setdefault("LESS", "FRX")
+    pager = os.environ.get("PAGER") or "less"
+    subprocess.run(pager, shell=True, input=output, text=True)
+
+
+def cmd_todone_view(arguments: list[str]) -> None:
+    """Show the completed-task history, newest first and grouped by day."""
+    text, tags = split_tags(arguments)
+    if text:
+        sys.exit("todone-view accepts tags only")
+
+    history = []
+    for line_number, task in enumerate(read_todone_file(), 1):
+        if task.completed_at is None:
+            sys.exit(f"invalid task on line {line_number}")
+        if has_tags(task, tags):
+            history.append((task.completed_at, task))
+
+    output = []
+    previous_date = None
+    for completed_at, task in reversed(history):
+        if completed_at.date() != previous_date:
+            previous_date = completed_at.date()
+            # completed_at.day rather than %d, which zero-pads.
+            output.append(
+                f"\n{completed_at:%A} {completed_at.day} {completed_at:%B %Y}\n"
+            )
+        description_and_tags = format_description_and_tags(task)
+        output.append(f"• {description_and_tags} ({completed_at:%H:%M})")
+    page("".join(line + "\n" for line in output))
+
+
+COMMANDS = {
+    "todo": cmd_todo,
+    "todo-edit": cmd_todo_edit,
+    "todone": cmd_todone,
+    "todone-archive": cmd_todone_archive,
+    "todone-view": cmd_todone_view,
+}
+
+
+def main() -> None:
+    command = Path(sys.argv[0]).name
+    arguments = sys.argv[1:]
+    # Exit quietly when output goes to a closed pipe (such as `todo | head
+    # -1`) rather than raising BrokenPipeError.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if command not in COMMANDS:
+        sys.exit(f"unrecognised command name: {command}")
+    # todo and todone parse their own options. The other commands take none.
+    if command not in ("todo", "todone") and arguments and arguments[0].startswith("-"):
+        sys.exit(f"unrecognised option: {arguments[0]}")
+    TODO_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TODO_FILE.touch()
+    TODONE_FILE.touch()
+    COMMANDS[command](arguments)
+
+
+if __name__ == "__main__":
+    main()
