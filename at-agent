@@ -157,6 +157,14 @@ def continuation(line, prefix):
     return text if text.strip() else None
 
 
+# Whether the current directory is $HOME or one of its ancestors, so a tree
+# scan would cover the whole home directory.
+def scanning_home():
+    home = Path.home().resolve()
+    cwd = Path.cwd().resolve()
+    return cwd == home or cwd in home.parents
+
+
 # Return candidate paths found by explicit args, rg, or matching queued inodes.
 def discover_paths(args, parser):
     mode = args.discover or ("args" if args.files else "inodes")
@@ -166,6 +174,13 @@ def discover_paths(args, parser):
         return [Path(p) for p in args.files], None, set()
     if args.files:
         parser.error(f"--discover={mode} does not accept file arguments")
+    if mode == "rg" and scanning_home():
+        parser.error("refusing to scan the home directory tree with rg")
+    if mode == "inodes" and scanning_home() and not args.dry_run:
+        parser.error(
+            "refusing to edit files found by inode under the home directory "
+            "tree. Use --dry-run"
+        )
     if mode == "rg":
         return rg_paths(), None, set()
     if mode == "inodes":
