@@ -5,23 +5,59 @@
 # SPDX-License-Identifier: MIT-0
 
 import argparse
+import hashlib
 import os
 import re
+import shlex
 import subprocess
 import sys
+import textwrap
 from datetime import datetime
 from pathlib import Path
 
 LINES_OF_CONTEXT = 3
-# Match punctuation prefix, @agent, optional !, then text.
-AGENT_LINE = re.compile(r"^(\s*[^A-Za-z0-9\s]{2,}\s+)@agent(!?)(.*)$")
+# Match punctuation prefix, @agent, @agent! or @human, then text.
+MARKER_LINE = re.compile(r"^(\s*[^A-Za-z0-9\s]{2,}\s+)@(agent!?|human)(.*)$")
 
 
-HEADER = """The user manually added these annotations for you, the agent, to react to.
+HEADER = """\
+The user manually added these annotations for you, the agent, to react to.
 They are either comment/explanation requests, which ask you to explain nearby
 code or answer the user's question without editing files, or action requests,
 which ask you to investigate and make the requested code change.
 """
+
+CONVERSATION_HEADER = """\
+The user is talking with you through @agent comments in their files. Each item
+below is an @agent comment awaiting your reply, marked with > among nearby lines
+and any earlier messages in its thread (your earlier replies appear as @human).
+Line numbers refer to the files as they are now. The comments stay in the files
+as a record of the conversation, so leave them in place. @agent! comments are
+action requests asking you to change the code. Plain @agent comments ask only
+for an answer.
+"""
+
+REPLY_FORMAT = """\
+Reply to every item above, in the order listed, with a single command. Each
+reply starts with a line of === and the item's id, shown in brackets after its
+number, followed by the reply text on the next lines:
+"""
+
+REPLY_INSTRUCTIONS = """\
+Keep the command and its file list as shown, and the quoted 'EOF' so the shell
+leaves your text alone. If at-agent rejects the replies, nothing is written:
+correct the ids and run the whole command again.
+
+For action requests, make the code change with your normal tools before running
+the command, and say briefly in that item's reply what you changed. Each reply is
+inserted into the file as a comment directly below its @agent comment. at-agent
+adds the comment markers and the @human tag and wraps long lines, so write plain
+text without them, with each paragraph or list item on a single line. Keep
+replies short, as they will live in the code: a sentence or two is often enough,
+and never more than three short paragraphs. Show any code by indenting it four
+spaces rather than using ``` fences. at-agent --write-agent-reply reports
+anything still pending, so once it says nothing is pending you are done: don't
+re-read the files to check or run at-agent -c again."""
 
 
 # Treat files containing NUL bytes near the start as binary.
@@ -138,23 +174,44 @@ def rg_paths():
     return [Path(line) for line in result.stdout.splitlines()]
 
 
-# Parse a whole-line @agent marker, returning the constituent groups.
+# Parse a whole-line @agent or @human marker, returning the constituent groups.
 def parse_marker(line):
-    m = AGENT_LINE.match(line)
+    m = MARKER_LINE.match(line)
     if not m:
         return None
-    prefix, bang, rest = m.groups()
+    prefix, tag, rest = m.groups()
     if rest and not rest[0].isspace():
         return None
-    return prefix, bool(bang), rest.strip()
+    return prefix, tag, rest.strip()
 
 
-# Return continuation text when a following comment line shares the marker prefix.
+# Return continuation text when a following comment line shares the marker
+# prefix. A line of just the prefix continues the block as a blank line.
 def continuation(line, prefix):
+    if line.rstrip() == prefix.rstrip():
+        return ""
     if not line.startswith(prefix) or parse_marker(line):
         return None
-    text = line[len(prefix) :]
-    return text if text.strip() else None
+    return line[len(prefix) :]
+
+
+# Yield (start, end, prefix, tag, text) for each marker and its continuation
+# lines, lines[start:end], where text holds the remark and continuation text.
+def marker_blocks(lines):
+    i = 0
+    while i < len(lines):
+        marker = parse_marker(lines[i])
+        if not marker:
+            i += 1
+            continue
+        start = i
+        prefix, tag, remark = marker
+        text = [remark]
+        i += 1
+        while i < len(lines) and (cont := continuation(lines[i], prefix)) is not None:
+            text.append(cont)
+            i += 1
+        yield start, i, prefix, tag, text
 
 
 # Whether the current directory is $HOME or one of its ancestors, so a tree
@@ -176,7 +233,7 @@ def discover_paths(args, parser):
         parser.error(f"--discover={mode} does not accept file arguments")
     if mode == "rg" and scanning_home():
         parser.error("refusing to scan the home directory tree with rg")
-    if mode == "inodes" and scanning_home() and not args.dry_run:
+    if mode == "inodes" and scanning_home() and not (args.dry_run or args.chat):
         parser.error(
             "refusing to edit files found by inode under the home directory "
             "tree. Use --dry-run"
@@ -190,40 +247,42 @@ def discover_paths(args, parser):
     parser.error(f"unknown discovery mode: {mode}")
 
 
-# Remove @agent markers, returning whether the file was read and any
-# directives. Skip files we heuristically determine as being binary.
-def process(path, dry_run):
+# Return the text of path, or None if it is unreadable or heuristically
+# binary.
+def read_text(path):
     if is_binary_file(path):
-        return False, []
+        return None
     try:
-        file_text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        return path.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError as e:
         print(f"warning: could not read {path}: {e}", file=sys.stderr)
+        return None
+
+
+# Write lines back to path, preserving undecodable bytes.
+def write_lines(path, lines):
+    path.write_text("\n".join(lines), encoding="utf-8", errors="surrogateescape")
+
+
+# Remove @agent markers (and @human ones if strip is True), returning whether
+# the file was read and any directives. Skip files we heuristically determine as
+# being binary.
+def process(path, dry_run, strip):
+    file_text = read_text(path)
+    if file_text is None:
         return False, []
     lines = file_text.split("\n")
 
     clean_lines = []
     remarks = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        marker = parse_marker(line)
-        if not marker:
-            clean_lines.append(line)
-            i += 1
+    pos = 0
+    for start, end, _, tag, text in marker_blocks(lines):
+        if tag == "human" and not strip:
             continue
-
-        marker_line = i
-        prefix, bang, request = marker
-        remark_text = [f"@agent{'!' if bang else ''} {request or '(no text)'}"]
-        i += 1
-        while i < len(lines) and (cont := continuation(lines[i], prefix)) is not None:
-            remark_text.append(cont)
-            i += 1
-
-        ctx = lines[
-            max(0, marker_line - LINES_OF_CONTEXT) : marker_line + 1 + LINES_OF_CONTEXT
-        ]
+        clean_lines += lines[pos:start]
+        pos = end
+        bang = tag == "agent!"
+        ctx = lines[max(0, start - LINES_OF_CONTEXT) : start + 1 + LINES_OF_CONTEXT]
         if ctx and ctx[-1] == "" and file_text.endswith("\n"):
             ctx = ctx[:-1]
         remarks.append(
@@ -234,17 +293,134 @@ def process(path, dry_run):
                 # in the cleaned file. Context still comes from the original file.
                 "line": len(clean_lines) + 1,
                 "kind": "action request" if bang else "comment/explanation request",
-                "text": remark_text,
+                "text": [f"@{tag} {text[0] or '(no text)'}"] + text[1:],
                 "context": ctx,
                 "lang": path.suffix[1:] or "text",
             }
         )
+    clean_lines += lines[pos:]
 
     if remarks and not dry_run:
-        path.write_text(
-            "\n".join(clean_lines), encoding="utf-8", errors="surrogateescape"
-        )
+        write_lines(path, clean_lines)
     return True, remarks
+
+
+# Return the @agent blocks in paths that aren't directly followed by a @human
+# reply, each with an id hashed from its thread so far.
+def pending_blocks(paths):
+    items = []
+    for path in sorted(paths):
+        # Show paths in the current tree relative to it, for readability.
+        if path.is_relative_to(Path.cwd()):
+            path = path.relative_to(Path.cwd())
+        text = read_text(path)
+        if text is None:
+            continue
+        lines = text.removesuffix("\n").split("\n")
+        thread_end = thread_prefix = None
+        for start, end, prefix, tag, _ in marker_blocks(lines):
+            if start != thread_end or prefix != thread_prefix:
+                thread_start = start
+            thread_end, thread_prefix = end, prefix
+            following = parse_marker(lines[end]) if end < len(lines) else None
+            replied = following is not None and following[:2] == (prefix, "human")
+            if tag == "human" or replied:
+                continue
+            thread = "\n".join(lines[thread_start:end])
+            digest = hashlib.sha256(thread.encode(errors="surrogateescape"))
+            items.append(
+                {
+                    "file": path,
+                    "line": start + 1,
+                    "end": end,
+                    "prefix": prefix,
+                    "id": digest.hexdigest()[:4],
+                    "context": thread_context(lines, thread_start, start, end),
+                }
+            )
+    return items
+
+
+# Return numbered lines around a block and its earlier thread, marking the
+# block's own lines with >.
+def thread_context(lines, thread_start, start, end):
+    first = max(0, thread_start - LINES_OF_CONTEXT)
+    stop = min(len(lines), end + LINES_OF_CONTEXT)
+    ctx = []
+    for n in range(first, stop):
+        mark = ">" if start <= n < end else " "
+        ctx.append(f"   {mark} {n + 1:4} | {lines[n]}")
+    return ctx
+
+
+# Format a reply as @human comment lines, wrapping all but blank or code lines.
+def format_reply(text, prefix):
+    out = []
+    for line in ("@human " + text.strip("\n")).split("\n"):
+        if not line.strip() or line.startswith(("    ", "\t")):
+            out.append(line.rstrip())
+        else:
+            out += textwrap.wrap(
+                line, 100 - len(prefix), break_long_words=False, break_on_hyphens=False
+            )
+    return [prefix + line if line else prefix.rstrip() for line in out]
+
+
+# Produce agent-facing report of pending remarks, with reply instructions.
+def build_conversation_report(items):
+    lines = [CONVERSATION_HEADER]
+    for i, item in enumerate(items, 1):
+        lines += [f"{i}. [{item['id']}] {item['file']}:{item['line']}"]
+        lines += item["context"] + [""]
+    # List the files in the order --write-agent-reply will process them.
+    files = sorted({item["file"] for item in items})
+    quoted = " ".join(shlex.quote(str(path)) for path in files)
+    lines += [REPLY_FORMAT, f"at-agent --write-agent-reply {quoted} <<'EOF'"]
+    for i, item in enumerate(items, 1):
+        lines += [f"=== {item['id']}", f"Your reply to item {i}."]
+    lines += ["EOF", "", REPLY_INSTRUCTIONS]
+    return "\n".join(lines)
+
+
+# Insert the replies read from stdin below the pending blocks they name, in
+# order, working bottom-up so that line indices stay valid.
+def reply(paths, dry_run):
+    replies = []
+    for line in sys.stdin.read().split("\n"):
+        if m := re.match(r"=== *(\S+) *$", line):
+            replies.append((m[1], []))
+        elif replies:
+            replies[-1][1].append(line)
+    items = pending_blocks(paths)
+
+    # Match each reply to the next pending block with its id, so blocks the
+    # agent hasn't seen are skipped and duplicate ids resolve in order.
+    matched = []
+    k = 0
+    for rid, text in replies:
+        while k < len(items) and items[k]["id"] != rid:
+            k += 1
+        if k == len(items):
+            print(build_conversation_report(items))
+            sys.exit(
+                f"error: reply '{rid}' doesn't match a pending item, or is out of "
+                "order; no replies were inserted. The pending items are listed above."
+            )
+        matched.append((items[k], "\n".join(text)))
+        k += 1
+
+    files = {}
+    for item, text in reversed(matched):
+        path, end = item["file"], item["end"]
+        if path not in files:
+            files[path] = read_text(path).split("\n")
+        files[path][end:end] = format_reply(text, item["prefix"])
+    if dry_run:
+        print(f"{len(matched)} replies would be inserted across {len(files)} files.")
+        return
+    for path, lines in files.items():
+        write_lines(path, lines)
+    print(f"Inserted {len(matched)} replies.")
 
 
 # Produce agent-facing report in standard format.
@@ -284,14 +460,50 @@ def main():
     parser.add_argument(
         "--dry-run", action="store_true", help="report remarks without editing files"
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "-c",
+        "--chat",
+        action="store_true",
+        help="keep @agent remarks and report those awaiting a @human reply",
+    )
+    mode.add_argument(
+        "--write-agent-reply",
+        action="store_true",
+        help="insert the agent's @human replies from stdin into the given files",
+    )
+    mode.add_argument(
+        "--strip",
+        action="store_true",
+        help="remove all @agent and @human remarks, ending their conversations",
+    )
     parser.add_argument("files", nargs="*")
     args = parser.parse_args()
+    if args.write_agent_reply and not args.files:
+        parser.error("--write-agent-reply requires file arguments")
 
     paths, inode_queue, found_inodes = discover_paths(args, parser)
+    if args.write_agent_reply:
+        reply(paths, args.dry_run)
+        if args.dry_run:
+            return
+    if args.write_agent_reply or args.chat:
+        if inode_queue is not None and not args.dry_run:
+            consume_inode_queue(inode_queue, found_inodes)
+        items = pending_blocks(paths)
+        if not items:
+            print(
+                "Nothing is pending. You are done: there is no need to re-read the "
+                "files or run at-agent -c again."
+            )
+            return
+        print(build_conversation_report(items))
+        return
+
     remarks = []
     processed_inodes = set()
     for path in paths:
-        processed, path_remarks = process(path, args.dry_run)
+        processed, path_remarks = process(path, args.dry_run, args.strip)
         remarks.extend(path_remarks)
         if processed and inode_queue is not None:
             processed_inodes.add(path.stat().st_ino)
@@ -301,6 +513,10 @@ def main():
 
     if not remarks:
         print("No @agent remarks found.")
+        return
+    if args.strip:
+        action = "Would remove" if args.dry_run else "Removed"
+        print(f"{action} {len(remarks)} @agent and @human remarks.")
         return
 
     report = build_report(remarks, args.dry_run)
