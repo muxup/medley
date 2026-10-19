@@ -16,8 +16,11 @@ from datetime import datetime
 from pathlib import Path
 
 LINES_OF_CONTEXT = 3
-# Match punctuation prefix, @agent, @agent! or @human, then text.
-MARKER_LINE = re.compile(r"^(\s*[^A-Za-z0-9\s]{2,}\s+)@(agent!?|human)(.*)$")
+# Match punctuation prefix, @agent, @agent! or @human, then any text after
+# whitespace.
+MARKER_LINE = re.compile(r"^(\s*[^A-Za-z0-9\s]{2,}\s+)@(agent!?|human)(\s.*)?$")
+# The @agent part of MARKER_LINE, for rg to find candidate files.
+RG_PATTERN = r"^\s*[^[:alnum:][:space:]]{2,}\s+@agent!?(?:\s|$)"
 
 
 HEADER = """\
@@ -60,16 +63,6 @@ anything still pending, so once it says nothing is pending you are done: don't
 re-read the files to check or run at-agent -c again."""
 
 
-# Treat files containing NUL bytes near the start as binary.
-def is_binary_file(path):
-    try:
-        with path.open("rb") as f:
-            return b"\0" in f.read(8192)
-    except OSError as e:
-        print(f"warning: could not read {path}: {e}", file=sys.stderr)
-        return True
-
-
 # Return the per-user state directory, creating it when needed.
 def state_dir():
     root = os.environ.get("XDG_STATE_HOME")
@@ -80,26 +73,24 @@ def state_dir():
     return directory
 
 
-# Read the editor-written set of candidate inodes.
+# Read the editor-written queue of candidate inodes, returning its text and the
+# inodes in it.
 def read_inode_queue():
     path = state_dir() / "inodes"
     try:
         text = path.read_text()
-        inodes = {int(line.strip()) for line in text.splitlines() if line.strip()}
-        return path, text, inodes
+        return text, {int(line.strip()) for line in text.splitlines() if line.strip()}
     except FileNotFoundError:
         print(f"warning: inode list not found: {path}", file=sys.stderr)
     except (OSError, ValueError) as e:
         print(f"warning: could not read inode list {path}: {e}", file=sys.stderr)
-    return path, "", set()
+    return "", set()
 
 
 # Find if any of the flagged inodes are present within the current directory
 # tree.
-def inode_paths(queue):
-    _, _, inodes = queue
+def inode_paths(inodes):
     wanted = set(inodes)
-    found = set()
     paths = []
     stack = [Path.cwd()]
     while wanted and stack:
@@ -118,18 +109,19 @@ def inode_paths(queue):
                         if inode not in wanted:
                             continue
                         paths.append(Path(entry.path))
-                        found.add(inode)
                         wanted.remove(inode)
                 except OSError:
                     pass
-    return paths, found
+    return paths
 
 
-# Remove consumed inodes, unless the editor changed the queue after we read it.
-def consume_inode_queue(queue, found):
+# Remove the inodes of paths from the queue, unless the editor changed it after
+# we read original_text.
+def consume_inode_queue(original_text, paths):
+    found = {path.stat().st_ino for path in paths}
     if not found:
         return
-    path, original_text, _ = queue
+    path = state_dir() / "inodes"
     try:
         current_text = path.read_text()
     except OSError as e:
@@ -154,14 +146,7 @@ def consume_inode_queue(queue, found):
 def rg_paths():
     try:
         result = subprocess.run(
-            [
-                "rg",
-                "-l",
-                r"^\s*[^[:alnum:][:space:]]{2,}\s+@agent!?(?:\s|$)",
-                ".",
-            ],
-            text=True,
-            capture_output=True,
+            ["rg", "-l", RG_PATTERN, "."], text=True, capture_output=True
         )
     except OSError as e:
         print(f"warning: could not run rg: {e}", file=sys.stderr)
@@ -177,12 +162,7 @@ def rg_paths():
 # Parse a whole-line @agent or @human marker, returning the constituent groups.
 def parse_marker(line):
     m = MARKER_LINE.match(line)
-    if not m:
-        return None
-    prefix, tag, rest = m.groups()
-    if rest and not rest[0].isspace():
-        return None
-    return prefix, tag, rest.strip()
+    return m and (m[1], m[2], (m[3] or "").strip())
 
 
 # Return continuation text when a following comment line shares the marker
@@ -222,13 +202,14 @@ def scanning_home():
     return cwd == home or cwd in home.parents
 
 
-# Return candidate paths found by explicit args, rg, or matching queued inodes.
+# Return candidate paths found by explicit args, rg, or matching queued inodes,
+# and the queue's text if it was used.
 def discover_paths(args, parser):
     mode = args.discover or ("args" if args.files else "inodes")
     if mode == "args":
         if not args.files:
             parser.error("--discover=args requires file arguments")
-        return [Path(p) for p in args.files], None, set()
+        return [Path(p) for p in args.files], None
     if args.files:
         parser.error(f"--discover={mode} does not accept file arguments")
     if mode == "rg" and scanning_home():
@@ -239,21 +220,20 @@ def discover_paths(args, parser):
             "tree. Use --dry-run"
         )
     if mode == "rg":
-        return rg_paths(), None, set()
+        return rg_paths(), None
     if mode == "inodes":
-        queue = read_inode_queue()
-        paths, found = inode_paths(queue)
-        return paths, queue, found
+        queue_text, inodes = read_inode_queue()
+        return inode_paths(inodes), queue_text
     parser.error(f"unknown discovery mode: {mode}")
 
 
-# Return the text of path, or None if it is unreadable or heuristically
-# binary.
+# Return the text of path, or None if it is unreadable or binary (heuristically,
+# having a NUL byte near the start).
 def read_text(path):
-    if is_binary_file(path):
-        return None
     try:
-        return path.read_text(encoding="utf-8", errors="surrogateescape")
+        with path.open(encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read(8192)
+            return None if "\0" in text else text + f.read()
     except OSError as e:
         print(f"warning: could not read {path}: {e}", file=sys.stderr)
         return None
@@ -295,7 +275,6 @@ def process(path, dry_run, strip):
                 "kind": "action request" if bang else "comment/explanation request",
                 "text": [f"@{tag} {text[0] or '(no text)'}"] + text[1:],
                 "context": ctx,
-                "lang": path.suffix[1:] or "text",
             }
         )
     clean_lines += lines[pos:]
@@ -482,14 +461,14 @@ def main():
     if args.write_agent_reply and not args.files:
         parser.error("--write-agent-reply requires file arguments")
 
-    paths, inode_queue, found_inodes = discover_paths(args, parser)
+    paths, queue_text = discover_paths(args, parser)
     if args.write_agent_reply:
         reply(paths, args.dry_run)
         if args.dry_run:
             return
     if args.write_agent_reply or args.chat:
-        if inode_queue is not None and not args.dry_run:
-            consume_inode_queue(inode_queue, found_inodes)
+        if queue_text is not None and not args.dry_run:
+            consume_inode_queue(queue_text, paths)
         items = pending_blocks(paths)
         if not items:
             print(
@@ -501,15 +480,15 @@ def main():
         return
 
     remarks = []
-    processed_inodes = set()
+    processed_paths = []
     for path in paths:
         processed, path_remarks = process(path, args.dry_run, args.strip)
         remarks.extend(path_remarks)
-        if processed and inode_queue is not None:
-            processed_inodes.add(path.stat().st_ino)
+        if processed:
+            processed_paths.append(path)
 
-    if inode_queue is not None and not args.dry_run:
-        consume_inode_queue(inode_queue, found_inodes & processed_inodes)
+    if queue_text is not None and not args.dry_run:
+        consume_inode_queue(queue_text, processed_paths)
 
     if not remarks:
         print("No @agent remarks found.")
