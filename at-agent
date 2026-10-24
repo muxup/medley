@@ -52,7 +52,9 @@ leaves your text alone. If at-agent rejects the replies, nothing is written:
 correct the ids and run the whole command again.
 
 For action requests, make the code change with your normal tools before running
-the command, and say briefly in that item's reply what you changed. Each reply is
+the command, and say briefly in that item's reply what you changed. If an edit
+would put two different @agent threads on adjacent lines, separate them with a
+blank line, as adjacent threads merge and their ids change. Each reply is
 inserted into the file as a comment directly below its @agent comment. at-agent
 adds the comment markers and the @human tag and wraps long lines, so write plain
 text without them, with each paragraph or list item on a single line. Keep
