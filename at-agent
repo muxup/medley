@@ -230,10 +230,11 @@ def discover_paths(args, parser):
 
 
 # Return the text of path, or None if it is unreadable or binary (heuristically,
-# having a NUL byte near the start).
+# having a NUL byte near the start). Line endings are left untranslated, so CRLF
+# lines keep their \r.
 def read_text(path):
     try:
-        with path.open(encoding="utf-8", errors="surrogateescape") as f:
+        with path.open(encoding="utf-8", errors="surrogateescape", newline="") as f:
             text = f.read(8192)
             return None if "\0" in text else text + f.read()
     except OSError as e:
@@ -243,7 +244,9 @@ def read_text(path):
 
 # Write lines back to path, preserving undecodable bytes.
 def write_lines(path, lines):
-    path.write_text("\n".join(lines), encoding="utf-8", errors="surrogateescape")
+    path.write_text(
+        "\n".join(lines), encoding="utf-8", errors="surrogateescape", newline=""
+    )
 
 
 # Remove @agent markers (and @human ones if strip is True), returning whether
