@@ -250,20 +250,28 @@ def write_lines(path, lines):
 
 
 # Remove @agent markers (and @human ones if strip is True), returning whether
-# the file was read and any directives. Skip files we heuristically determine as
-# being binary.
+# the file was processed and any directives. Skip files we heuristically
+# determine as being binary.
 def process(path, dry_run, strip):
     file_text = read_text(path)
     if file_text is None:
         return False, []
     lines = file_text.split("\n")
+    blocks = list(marker_blocks(lines))
+    # Without --strip, skip a file holding a conversation, as removing only its
+    # @agent remarks would leave the @human replies behind.
+    if not strip and any(tag == "human" for _, _, _, tag, _ in blocks):
+        print(
+            f"warning: skipping {path}, which has @human replies: "
+            "use at-agent -c to continue or --strip to end the conversation",
+            file=sys.stderr,
+        )
+        return False, []
 
     clean_lines = []
     remarks = []
     pos = 0
-    for start, end, _, tag, text in marker_blocks(lines):
-        if tag == "human" and not strip:
-            continue
+    for start, end, _, tag, text in blocks:
         clean_lines += lines[pos:start]
         pos = end
         bang = tag == "agent!"
