@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT-0 license, see LICENSE for details.
+# SPDX-License-Identifier: MIT-0
+
+# `gen` writes a diff showing the whole of each changed file. Editing its context
+# and '+' lines edits the file, and `apply` writes the edited files to the
+# worktree, after checking they haven't changed since the diff was generated.
+
+import argparse
+import difflib
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# Pick the largest context git accepts so full contents of modified files are
+# included in the generated diff.
+LINES_OF_CONTEXT = 2147483647
+# Override config that changes diff output in ways apply can't parse.
+DIFF_CFG = [
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.srcPrefix=a/",
+    "-c",
+    "diff.dstPrefix=b/",
+    "-c",
+    "core.quotePath=false",
+]
+DIFF_ARGS = [
+    f"-U{LINES_OF_CONTEXT}",
+    "--full-index",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--no-relative",
+    "--ignore-submodules",
+]
+# Leave every generated diff with a trailer to identify we created it and make
+# it easy to reject diffs not created by this tool.
+TRAILER = b"# review-diff\n"
+
+AGENT_HELP = """\
+The file is a Git diff in which each changed file is one hunk covering the
+whole file. To change a file, edit its hunk:
+
+- Context lines (starting with a space) and + lines are the file's contents.
+  Edit them directly, starting any added line with + or a space.
+- Lines starting with - are ignored.
+- Lines starting with # are comments, not part of the file.
+- Don't update hunk headers or line counts. Leave the header lines and the
+  final "# review-diff" line as they are.
+
+Check your edits with "review-diff apply --check FILE", but leave
+"review-diff apply" to the user."""
+
+
+# One file's part of the diff: its path, its hunk's context and '+' lines, and
+# new_id, the second ID on its "index OLD..NEW" line.
+@dataclass
+class FileDiff:
+    path: str = ""
+    new_id: str = ""
+    lines: list[bytes] = field(default_factory=list)
+
+
+# Run a git command and return its output, exiting with its error on failure.
+def run_git(args):
+    result = subprocess.run(["git"] + args, capture_output=True)
+    if result.returncode:
+        sys.exit(f"git failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+# Write a full-context diff of BASE -> HEAD (or HEAD -> index with --staged) to
+# stdout, limited to args.paths if any. BASE... means the merge base, as with
+# git diff.
+def do_gen(args):
+    if run_git(["diff", "--name-only", "--no-relative", "--"] + args.paths):
+        sys.exit("files in the diff have unstaged changes; commit, stage or stash them")
+    if args.staged:
+        endpoints = ["--cached", "HEAD"]
+    elif args.base.endswith("..."):
+        endpoints = [args.base + "HEAD"]
+    else:
+        endpoints = [args.base, "HEAD"]
+    out = run_git(DIFF_CFG + ["diff"] + DIFF_ARGS + endpoints + ["--"] + args.paths)
+    if not out:
+        sys.exit("no changes to diff")
+    sys.stdout.buffer.write(out + TRAILER)
+
+
+# Parse the (possibly edited) diff into a FileDiff for each file with a hunk,
+# other than deleted files.
+def parse_diff(data):
+    file_diffs = []
+    file_diff = None
+    in_hunk = False
+    for lineno, line in enumerate(data.removesuffix(b"\n").split(b"\n"), start=1):
+        if line.startswith(b"diff --git "):
+            file_diff = FileDiff()
+            in_hunk = False
+        elif file_diff is None:
+            continue
+        elif in_hunk:
+            # A blank line is a context line whose leading space was stripped.
+            if line == b"" or line.startswith((b" ", b"+")):
+                file_diff.lines.append(line[1:])
+            elif not line.startswith((b"-", b"#", b"@@", b"\\")):
+                sys.exit(f"line {lineno}: unrecognized patch line: {line.decode()!r}")
+        elif line.startswith(b"@@"):
+            if not file_diff.path or not file_diff.new_id:
+                sys.exit(f"line {lineno}: hunk without a path or index line")
+            in_hunk = True
+            # A deleted file's new_id is all zeros.
+            if set(file_diff.new_id) != {"0"}:
+                file_diffs.append(file_diff)
+        elif line.startswith(b"index "):
+            # "index OLD..NEW MODE"
+            file_diff.new_id = line.split()[1].partition(b"..")[2].decode()
+        elif line.startswith((b"--- a/", b"+++ b/")):
+            # Git ends paths containing spaces with a tab.
+            file_diff.path = line[6:].removesuffix(b"\t").decode()
+    return file_diffs
+
+
+# Read and parse a diff written by gen.
+def read_diff(file):
+    path = Path(file)
+    if not path.is_file():
+        sys.exit(f"{file}: no such file")
+    data = path.read_bytes()
+    if not data.endswith(TRAILER):
+        sys.exit(
+            f"{file}: missing final '# review-diff' line; "
+            f"not generated by review-diff gen, or truncated"
+        )
+    return parse_diff(data.removesuffix(TRAILER))
+
+
+# Return a file's contents with your edits, keeping before's final newline or
+# lack of one.
+def edited_contents(file_diff, before):
+    after = b"\n".join(file_diff.lines)
+    if file_diff.lines and before.endswith(b"\n"):
+        after += b"\n"
+    return after
+
+
+# Exit unless path is in the repository and unchanged since gen in both the
+# index and the worktree.
+def require_unchanged(path, new_id, before):
+    if path.startswith("/") or ".." in path.split("/"):
+        sys.exit(f"{path}: refusing path outside the repository")
+    staged = run_git(["rev-parse", f":{path}"]).decode().strip()
+    worktree = Path(path)
+    if staged != new_id or not worktree.is_file() or worktree.read_bytes() != before:
+        sys.exit(f"{path}: changed since the diff was generated; regenerate it")
+
+
+# Return a unified diff of an edit to path.
+def format_edit(path, before, after):
+    diff = difflib.diff_bytes(
+        difflib.unified_diff,
+        before.removesuffix(b"\n").split(b"\n"),
+        after.removesuffix(b"\n").split(b"\n"),
+        b"a/" + path.encode(),
+        b"b/" + path.encode(),
+        lineterm=b"",
+    )
+    return b"".join(line + b"\n" for line in diff)
+
+
+# Write the edited files to the worktree, leaving the index alone, or with
+# --check print the edits as a diff.
+def do_apply(args):
+    file_diffs = read_diff(args.file)
+    # Diff paths are relative to the top of the repository.
+    os.chdir(run_git(["rev-parse", "--show-toplevel"]).decode().strip())
+    # Check every edit before writing any.
+    edits = []
+    for file_diff in file_diffs:
+        # Symlinks have no text to edit.
+        if Path(file_diff.path).is_symlink():
+            continue
+        before = run_git(["cat-file", "blob", file_diff.new_id])
+        after = edited_contents(file_diff, before)
+        if after != before:
+            require_unchanged(file_diff.path, file_diff.new_id, before)
+            edits.append((file_diff.path, before, after))
+    if not edits:
+        print("review-diff: no edits to apply")
+        return
+    for path, before, after in edits:
+        if args.check:
+            sys.stdout.buffer.write(format_edit(path, before, after))
+        else:
+            Path(path).write_bytes(after)
+            print(f"review-diff: applied edits to {path}")
+
+
+def do_agent_help(args):
+    print(AGENT_HELP)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="review Git changes by editing a full-context diff"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    gen = sub.add_parser(
+        "gen",
+        usage="review-diff gen (BASE | --staged) [-- PATH...]",
+        help="write a full-context diff to stdout",
+    )
+    gen.set_defaults(func=do_gen)
+    what = gen.add_mutually_exclusive_group(required=True)
+    what.add_argument(
+        "base", nargs="?", help="diff BASE -> HEAD (BASE... from the merge base)"
+    )
+    what.add_argument(
+        "--staged", action="store_true", help="diff staged changes (HEAD -> index)"
+    )
+    apply_ = sub.add_parser("apply", help="apply edits made to a diff from gen")
+    apply_.set_defaults(func=do_apply)
+    apply_.add_argument("file", help="the edited diff")
+    apply_.add_argument(
+        "--check",
+        action="store_true",
+        help="validate and print the edits as a diff without applying them",
+    )
+    agent_help = sub.add_parser(
+        "agent-help", help="explain how to edit the diff, for agents"
+    )
+    agent_help.set_defaults(func=do_agent_help)
+
+    # Split off pathspecs ourselves, as argparse can't tell them from BASE.
+    argv, paths = sys.argv[1:], []
+    if "--" in argv:
+        split = argv.index("--")
+        argv, paths = argv[:split], argv[split + 1 :]
+    args = parser.parse_args(argv)
+    if paths and args.command != "gen":
+        parser.error("only gen accepts paths after --")
+    args.paths = paths
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
