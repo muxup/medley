@@ -469,8 +469,8 @@ def main():
         if args.dry_run:
             return
     if args.write_agent_reply or args.chat:
-        if queue_text is not None and not args.dry_run:
-            consume_inode_queue(queue_text, paths)
+        # Leave the inode queue alone: a conversation's files stay queued until
+        # --strip ends it, so that --strip can still find them.
         items = pending_blocks(paths)
         if not items:
             print(
