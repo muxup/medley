@@ -14,12 +14,16 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 LINES_OF_CONTEXT = 3
 # Match punctuation prefix, @agent, @agent! or @human, then any text after
 # whitespace.
-MARKER_LINE = re.compile(r"^(\s*[^A-Za-z0-9\s]{2,}\s+)@(agent!?|human)(\s.*)?$")
+MARKER_LINE = re.compile(
+    r"^(?P<prefix>\s*[^A-Za-z0-9\s]{2,}\s+)@(?P<tag>agent!?|human)(?P<text>\s.*)?$"
+)
 # The @agent part of MARKER_LINE, for rg to find candidate files.
 RG_PATTERN = r"^\s*[^[:alnum:][:space:]]{2,}\s+@agent!?(?:\s|$)"
 
@@ -66,8 +70,38 @@ anything still pending, so once it says nothing is pending you are done: don't
 re-read the files to check or run at-agent -c again."""
 
 
+# A marker line and its continuation lines, lines[start:end], with the text of
+# each.
+class MarkerBlock(NamedTuple):
+    start: int
+    end: int
+    prefix: str
+    tag: str
+    text: list[str]
+
+
+# An @agent remark removed from a file, to be reported to the agent.
+class RemovedRemark(NamedTuple):
+    file: Path
+    line: int
+    kind: str
+    text: list[str]
+    context: list[str]
+
+
+# An @agent remark, lines[start:end] of file, awaiting a @human reply, with
+# the id and numbered context lines reported for it.
+class PendingRemark(NamedTuple):
+    file: Path
+    start: int
+    end: int
+    prefix: str
+    id: str
+    context: list[str]
+
+
 # Return the per-user state directory, creating it when needed.
-def state_dir():
+def state_dir() -> Path:
     root = os.environ.get("XDG_STATE_HOME")
     directory = (
         Path(root) / "at-agent" if root else Path.home() / ".local/state/at-agent"
@@ -78,7 +112,7 @@ def state_dir():
 
 # Read the editor-written queue of candidate inodes, returning its text and the
 # inodes in it.
-def read_inode_queue():
+def read_inode_queue() -> tuple[str, set[int]]:
     path = state_dir() / "inodes"
     try:
         text = path.read_text()
@@ -92,10 +126,10 @@ def read_inode_queue():
 
 # Find if any of the flagged inodes are present within the current directory
 # tree.
-def inode_paths(inodes):
+def inode_paths(inodes: set[int]) -> list[Path]:
     wanted = set(inodes)
     paths = []
-    stack = [Path.cwd()]
+    stack = [os.getcwd()]
     while wanted and stack:
         directory = stack.pop()
         try:
@@ -120,7 +154,7 @@ def inode_paths(inodes):
 
 # Remove the inodes of paths from the queue, unless the editor changed it after
 # we read original_text.
-def consume_inode_queue(original_text, paths):
+def consume_inode_queue(original_text: str, paths: list[Path]) -> None:
     found = {path.stat().st_ino for path in paths}
     if not found:
         return
@@ -146,7 +180,7 @@ def consume_inode_queue(original_text, paths):
 
 
 # Find candidate files by scanning the current tree with ripgrep.
-def rg_paths():
+def rg_paths() -> list[Path]:
     try:
         result = subprocess.run(
             ["rg", "-l", RG_PATTERN, "."], text=True, capture_output=True
@@ -162,44 +196,37 @@ def rg_paths():
     return [Path(line) for line in result.stdout.splitlines()]
 
 
-# Parse a whole-line @agent or @human marker, returning the constituent groups.
-def parse_marker(line):
-    m = MARKER_LINE.match(line)
-    return m and (m[1], m[2], (m[3] or "").strip())
-
-
 # Return continuation text when a following comment line shares the marker
 # prefix. A line of just the prefix continues the block as a blank line.
-def continuation(line, prefix):
+def continuation(line: str, prefix: str) -> str | None:
     if line.rstrip() == prefix.rstrip():
         return ""
-    if not line.startswith(prefix) or parse_marker(line):
+    if not line.startswith(prefix) or MARKER_LINE.match(line):
         return None
     return line[len(prefix) :]
 
 
-# Yield (start, end, prefix, tag, text) for each marker and its continuation
-# lines, lines[start:end], where text holds the remark and continuation text.
-def marker_blocks(lines):
+# Yield each marker line and its continuation lines as a MarkerBlock.
+def marker_blocks(lines: list[str]) -> Iterator[MarkerBlock]:
     i = 0
     while i < len(lines):
-        marker = parse_marker(lines[i])
+        marker = MARKER_LINE.match(lines[i])
         if not marker:
             i += 1
             continue
         start = i
-        prefix, tag, remark = marker
-        text = [remark]
+        prefix, tag = marker["prefix"], marker["tag"]
+        text = [(marker["text"] or "").strip()]
         i += 1
         while i < len(lines) and (cont := continuation(lines[i], prefix)) is not None:
             text.append(cont)
             i += 1
-        yield start, i, prefix, tag, text
+        yield MarkerBlock(start, i, prefix, tag, text)
 
 
 # Whether the current directory is $HOME or one of its ancestors, so a tree
 # scan would cover the whole home directory.
-def scanning_home():
+def scanning_home() -> bool:
     home = Path.home().resolve()
     cwd = Path.cwd().resolve()
     return cwd == home or cwd in home.parents
@@ -207,7 +234,9 @@ def scanning_home():
 
 # Return candidate paths found by explicit args, rg, or matching queued inodes,
 # and the queue's text if it was used.
-def discover_paths(args, parser):
+def discover_paths(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> tuple[list[Path], str | None]:
     mode = args.discover or ("args" if args.files else "inodes")
     if mode == "args":
         if not args.files:
@@ -233,7 +262,7 @@ def discover_paths(args, parser):
 # Return the text of path, or None if it is unreadable or binary (heuristically,
 # having a NUL byte near the start). Line endings are left untranslated, so CRLF
 # lines keep their \r.
-def read_text(path):
+def read_text(path: Path) -> str | None:
     try:
         with path.open(encoding="utf-8", errors="surrogateescape", newline="") as f:
             text = f.read(8192)
@@ -244,16 +273,18 @@ def read_text(path):
 
 
 # Write lines back to path, preserving undecodable bytes.
-def write_lines(path, lines):
+def write_lines(path: Path, lines: list[str]) -> None:
     path.write_text(
         "\n".join(lines), encoding="utf-8", errors="surrogateescape", newline=""
     )
 
 
 # Remove @agent markers (and @human ones if strip is True), returning whether
-# the file was processed, any directives, and with strip a diff of the removed
-# lines. Skip files we heuristically determine as being binary.
-def process(path, dry_run, strip):
+# the file was processed, the removed remarks, and with strip a diff of the
+# removed lines. Skip files we heuristically determine as being binary.
+def process(
+    path: Path, dry_run: bool, strip: bool
+) -> tuple[bool, list[RemovedRemark], list[str]]:
     file_text = read_text(path)
     if file_text is None:
         return False, [], []
@@ -261,7 +292,7 @@ def process(path, dry_run, strip):
     blocks = list(marker_blocks(lines))
     # Without --strip, skip a file holding a conversation, as removing only its
     # @agent remarks would leave the @human replies behind.
-    if not strip and any(tag == "human" for _, _, _, tag, _ in blocks):
+    if not strip and any(block.tag == "human" for block in blocks):
         print(
             f"warning: skipping {path}, which has @human replies: "
             "use at-agent -c to continue or --strip to end the conversation",
@@ -280,68 +311,74 @@ def process(path, dry_run, strip):
         if ctx and ctx[-1] == "" and file_text.endswith("\n"):
             ctx = ctx[:-1]
         remarks.append(
-            {
-                "file": str(path),
+            RemovedRemark(
+                file=path,
                 # clean_lines contains every retained line before this marker,
                 # so the next retained line is the same position the marker had
                 # in the cleaned file. Context still comes from the original file.
-                "line": len(clean_lines) + 1,
-                "kind": "action request" if bang else "comment/explanation request",
-                "text": [f"@{tag} {text[0] or '(no text)'}"] + text[1:],
-                "context": ctx,
-            }
+                line=len(clean_lines) + 1,
+                kind="action request" if bang else "comment/explanation request",
+                text=[f"@{tag} {text[0] or '(no text)'}"] + text[1:],
+                context=ctx,
+            )
         )
     clean_lines += lines[pos:]
 
     if remarks and not dry_run:
         write_lines(path, clean_lines)
-    removed = []
-    if strip:
-        removed = difflib.unified_diff(
-            lines, clean_lines, str(path), str(path), n=1, lineterm=""
-        )
+    if not strip:
+        return True, remarks, []
+    removed = difflib.unified_diff(
+        lines, clean_lines, str(path), str(path), n=1, lineterm=""
+    )
     return True, remarks, list(removed)
 
 
-# Return the @agent blocks in paths that aren't directly followed by a @human
+# Return the @agent remarks in paths that aren't directly followed by a @human
 # reply, each with an id hashed from its thread so far.
-def pending_blocks(paths):
-    items = []
+def pending_remarks(paths: list[Path]) -> list[PendingRemark]:
+    pending = []
     for path in sorted(paths):
         # Show paths in the current tree relative to it, for readability.
         if path.is_relative_to(Path.cwd()):
             path = path.relative_to(Path.cwd())
-        text = read_text(path)
-        if text is None:
+        file_text = read_text(path)
+        if file_text is None:
             continue
-        lines = text.removesuffix("\n").split("\n")
+        lines = file_text.removesuffix("\n").split("\n")
         thread_end = thread_prefix = None
         for start, end, prefix, tag, _ in marker_blocks(lines):
             if start != thread_end or prefix != thread_prefix:
                 thread_start = start
             thread_end, thread_prefix = end, prefix
-            following = parse_marker(lines[end]) if end < len(lines) else None
-            replied = following is not None and following[:2] == (prefix, "human")
+            following = MARKER_LINE.match(lines[end]) if end < len(lines) else None
+            replied = (
+                following is not None
+                and following["prefix"] == prefix
+                and following["tag"] == "human"
+            )
             if tag == "human" or replied:
                 continue
             thread = "\n".join(lines[thread_start:end])
             digest = hashlib.sha256(thread.encode(errors="surrogateescape"))
-            items.append(
-                {
-                    "file": path,
-                    "line": start + 1,
-                    "end": end,
-                    "prefix": prefix,
-                    "id": digest.hexdigest()[:4],
-                    "context": thread_context(lines, thread_start, start, end),
-                }
+            pending.append(
+                PendingRemark(
+                    file=path,
+                    start=start,
+                    end=end,
+                    prefix=prefix,
+                    id=digest.hexdigest()[:4],
+                    context=thread_context(lines, thread_start, start, end),
+                )
             )
-    return items
+    return pending
 
 
 # Return numbered lines around a block and its earlier thread, marking the
 # block's own lines with >.
-def thread_context(lines, thread_start, start, end):
+def thread_context(
+    lines: list[str], thread_start: int, start: int, end: int
+) -> list[str]:
     first = max(0, thread_start - LINES_OF_CONTEXT)
     stop = min(len(lines), end + LINES_OF_CONTEXT)
     ctx = []
@@ -352,7 +389,7 @@ def thread_context(lines, thread_start, start, end):
 
 
 # Format a reply as @human comment lines, wrapping all but blank or code lines.
-def format_reply(text, prefix):
+def format_reply(text: str, prefix: str) -> list[str]:
     out = []
     for line in ("@human " + text.strip("\n")).split("\n"):
         if not line.strip() or line.startswith(("    ", "\t")):
@@ -365,54 +402,54 @@ def format_reply(text, prefix):
 
 
 # Produce agent-facing report of pending remarks, with reply instructions.
-def build_conversation_report(items):
+def build_conversation_report(pending: list[PendingRemark]) -> str:
     lines = [CONVERSATION_HEADER]
-    for i, item in enumerate(items, 1):
-        lines += [f"{i}. [{item['id']}] {item['file']}:{item['line']}"]
-        lines += item["context"] + [""]
+    for i, remark in enumerate(pending, 1):
+        lines += [f"{i}. [{remark.id}] {remark.file}:{remark.start + 1}"]
+        lines += remark.context + [""]
     # List the files in the order --write-agent-reply will process them.
-    files = sorted({item["file"] for item in items})
+    files = sorted({remark.file for remark in pending})
     quoted = " ".join(shlex.quote(str(path)) for path in files)
     lines += [REPLY_FORMAT, f"at-agent --write-agent-reply {quoted} <<'EOF'"]
-    for i, item in enumerate(items, 1):
-        lines += [f"=== {item['id']}", f"Your reply to item {i}."]
+    for i, remark in enumerate(pending, 1):
+        lines += [f"=== {remark.id}", f"Your reply to item {i}."]
     lines += ["EOF", "", REPLY_INSTRUCTIONS]
     return "\n".join(lines)
 
 
-# Insert the replies read from stdin below the pending blocks they name, in
+# Insert the replies read from stdin below the pending remarks they name, in
 # order, working bottom-up so that line indices stay valid.
-def reply(paths, dry_run):
-    replies = []
-    for line in sys.stdin.read().split("\n"):
-        if m := re.match(r"=== *(\S+) *$", line):
-            replies.append((m[1], []))
-        elif replies:
-            replies[-1][1].append(line)
-    items = pending_blocks(paths)
+def reply(paths: list[Path], dry_run: bool) -> None:
+    # Split stdin into ids, each followed by the text of its reply.
+    parts = re.split(r"^=== *(\S+) *$", sys.stdin.read(), flags=re.MULTILINE)
+    replies = list(zip(parts[1::2], parts[2::2]))
+    pending = pending_remarks(paths)
 
-    # Match each reply to the next pending block with its id, so blocks the
+    # Match each reply to the next pending remark with its id, so remarks the
     # agent hasn't seen are skipped and duplicate ids resolve in order.
     matched = []
     k = 0
     for rid, text in replies:
-        while k < len(items) and items[k]["id"] != rid:
+        while k < len(pending) and pending[k].id != rid:
             k += 1
-        if k == len(items):
-            print(build_conversation_report(items))
+        if k == len(pending):
+            print(build_conversation_report(pending))
             sys.exit(
                 f"error: reply '{rid}' doesn't match a pending item, or is out of "
                 "order; no replies were inserted. The pending items are listed above."
             )
-        matched.append((items[k], "\n".join(text)))
+        matched.append((pending[k], text))
         k += 1
 
     files = {}
-    for item, text in reversed(matched):
-        path, end = item["file"], item["end"]
+    for remark, text in reversed(matched):
+        path, end = remark.file, remark.end
         if path not in files:
-            files[path] = read_text(path).split("\n")
-        files[path][end:end] = format_reply(text, item["prefix"])
+            file_text = read_text(path)
+            if file_text is None:
+                sys.exit(f"error: could not read {path}; no replies were inserted.")
+            files[path] = file_text.split("\n")
+        files[path][end:end] = format_reply(text, remark.prefix)
     if dry_run:
         print(f"{len(matched)} replies would be inserted across {len(files)} files.")
         return
@@ -422,7 +459,7 @@ def reply(paths, dry_run):
 
 
 # Produce agent-facing report in standard format.
-def build_report(remarks, dry_run):
+def build_report(remarks: list[RemovedRemark], dry_run: bool) -> str:
     lines = [HEADER]
     if dry_run:
         lines.append(
@@ -434,22 +471,22 @@ def build_report(remarks, dry_run):
         )
     lines += ["Relevant line numbers refer to the files after remark removal.", ""]
 
-    for i, r in enumerate(remarks, 1):
+    for i, remark in enumerate(remarks, 1):
         lines += [
-            f"{i}. {r['file']}",
-            f"   kind: {r['kind']}",
-            f"   relevant line number: {r['line']}",
+            f"{i}. {remark.file}",
+            f"   kind: {remark.kind}",
+            f"   relevant line number: {remark.line}",
             "   text:",
         ]
-        lines += [f"     {line}" for line in r["text"]]
+        lines += [f"     {line}" for line in remark.text]
         lines += ["   nearby context before removal:"]
-        lines += [f"     {line}" for line in r["context"]]
+        lines += [f"     {line}" for line in remark.context]
         lines += [""]
     return "\n".join(lines)
 
 
 # Write text to a new temporary file, returning its path.
-def write_temp_file(text, prefix):
+def write_temp_file(text: str, prefix: str) -> str:
     with tempfile.NamedTemporaryFile(
         "w",
         prefix=prefix,
@@ -462,7 +499,7 @@ def write_temp_file(text, prefix):
     return f.name
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="relay and remove @agent annotations")
     parser.add_argument(
         "--discover",
@@ -502,14 +539,14 @@ def main():
     if args.write_agent_reply or args.chat:
         # Leave the inode queue alone: a conversation's files stay queued until
         # --strip ends it, so that --strip can still find them.
-        items = pending_blocks(paths)
-        if not items:
+        pending = pending_remarks(paths)
+        if not pending:
             print(
                 "Nothing is pending. You are done: there is no need to re-read the "
                 "files or run at-agent -c again."
             )
             return
-        print(build_conversation_report(items))
+        print(build_conversation_report(pending))
         return
 
     remarks = []
@@ -532,8 +569,8 @@ def main():
         action = "Would remove" if args.dry_run else "Removed"
         print(f"{action} {len(remarks)} @agent and @human remarks.")
         if not args.dry_run:
-            path = write_temp_file("\n".join(removed), "at-agent-strip-")
-            print(f"Removed lines saved to: {path}")
+            backup = write_temp_file("\n".join(removed), "at-agent-strip-")
+            print(f"Removed lines saved to: {backup}")
         return
 
     report = build_report(remarks, args.dry_run)
