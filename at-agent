@@ -110,73 +110,45 @@ def state_dir() -> Path:
     return directory
 
 
-# Read the editor-written queue of candidate inodes, returning its text and the
-# inodes in it.
-def read_inode_queue() -> tuple[str, set[int]]:
-    path = state_dir() / "inodes"
+# Read the editor-written queue of edited files, a "DIR_INODE NAME" line for
+# each, returning the queued names keyed by directory inode. Unlike paths, these
+# are the same inside and outside a sandbox, and unlike a file's inode, they
+# survive a tool renaming a new file over it.
+def read_edited_file_queue() -> dict[int, set[str]]:
+    path = state_dir() / "edited_file_queue"
     try:
-        text = path.read_text()
-        return text, {int(line.strip()) for line in text.splitlines() if line.strip()}
+        lines = path.read_text().splitlines()
     except FileNotFoundError:
-        print(f"warning: inode list not found: {path}", file=sys.stderr)
+        print(f"warning: edited file queue not found: {path}", file=sys.stderr)
+        return {}
     except (OSError, ValueError) as e:
-        print(f"warning: could not read inode list {path}: {e}", file=sys.stderr)
-    return "", set()
+        print(f"warning: could not read edited file queue {path}: {e}", file=sys.stderr)
+        return {}
+    queued: dict[int, set[str]] = {}
+    for line in lines:
+        dir_inode, _, name = line.partition(" ")
+        if dir_inode.isdecimal() and name:
+            queued.setdefault(int(dir_inode), set()).add(name)
+        else:
+            print(
+                f"warning: ignoring malformed line in {path}: {line!r}", file=sys.stderr
+            )
+    return queued
 
 
-# Find if any of the flagged inodes are present within the current directory
-# tree.
-def inode_paths(inodes: set[int]) -> list[Path]:
-    wanted = set(inodes)
+# Return the paths of the queued files within the current directory tree.
+def queued_paths(queued: dict[int, set[str]]) -> list[Path]:
     paths = []
-    stack = [os.getcwd()]
-    while wanted and stack:
-        directory = stack.pop()
+    for directory, _, _ in Path.cwd().walk():
         try:
-            entries = os.scandir(directory)
+            dir_inode = directory.stat().st_ino
         except OSError:
             continue
-        with entries:
-            for entry in entries:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
-                    elif entry.is_file(follow_symlinks=False):
-                        inode = entry.inode()
-                        if inode not in wanted:
-                            continue
-                        paths.append(Path(entry.path))
-                        wanted.remove(inode)
-                except OSError:
-                    pass
+        for name in queued.get(dir_inode, ()):
+            path = directory / name
+            if path.is_file() and not path.is_symlink():
+                paths.append(path)
     return paths
-
-
-# Remove the inodes of paths from the queue, unless the editor changed it after
-# we read original_text.
-def consume_inode_queue(original_text: str, paths: list[Path]) -> None:
-    found = {path.stat().st_ino for path in paths}
-    if not found:
-        return
-    path = state_dir() / "inodes"
-    try:
-        current_text = path.read_text()
-    except OSError as e:
-        print(f"warning: could not read inode list {path}: {e}", file=sys.stderr)
-        return
-    if current_text != original_text:
-        print(
-            f"warning: inode list changed during run, not rewriting: {path}",
-            file=sys.stderr,
-        )
-        return
-
-    lines = [
-        line
-        for line in original_text.splitlines()
-        if line.strip() and int(line.strip()) not in found
-    ]
-    path.write_text("".join(f"{line}\n" for line in lines))
 
 
 # Find candidate files by scanning the current tree with ripgrep.
@@ -232,30 +204,27 @@ def scanning_home() -> bool:
     return cwd == home or cwd in home.parents
 
 
-# Return candidate paths found by explicit args, rg, or matching queued inodes,
-# and the queue's text if it was used.
+# Return candidate paths found by explicit args, rg, or the edited file queue.
 def discover_paths(
     args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> tuple[list[Path], str | None]:
-    mode = args.discover or ("args" if args.files else "inodes")
+) -> list[Path]:
+    mode = args.discover or ("args" if args.files else "queue")
     if mode == "args":
         if not args.files:
             parser.error("--discover=args requires file arguments")
-        return [Path(p) for p in args.files], None
+        return [Path(p) for p in args.files]
     if args.files:
         parser.error(f"--discover={mode} does not accept file arguments")
     if mode == "rg" and scanning_home():
         parser.error("refusing to scan the home directory tree with rg")
-    if mode == "inodes" and scanning_home() and not (args.dry_run or args.chat):
+    if mode == "queue" and scanning_home() and not (args.dry_run or args.chat):
         parser.error(
-            "refusing to edit files found by inode under the home directory "
-            "tree. Use --dry-run"
+            "refusing to edit queued files under the home directory tree. Use --dry-run"
         )
     if mode == "rg":
-        return rg_paths(), None
-    if mode == "inodes":
-        queue_text, inodes = read_inode_queue()
-        return inode_paths(inodes), queue_text
+        return rg_paths()
+    if mode == "queue":
+        return queued_paths(read_edited_file_queue())
     parser.error(f"unknown discovery mode: {mode}")
 
 
@@ -279,15 +248,15 @@ def write_lines(path: Path, lines: list[str]) -> None:
     )
 
 
-# Remove @agent markers (and @human ones if strip is True), returning whether
-# the file was processed, the removed remarks, and with strip a diff of the
-# removed lines. Skip files we heuristically determine as being binary.
+# Remove @agent markers (and @human ones if strip is True), returning the
+# removed remarks, and with strip a diff of the removed lines. Skip files we
+# heuristically determine as being binary.
 def process(
     path: Path, dry_run: bool, strip: bool
-) -> tuple[bool, list[RemovedRemark], list[str]]:
+) -> tuple[list[RemovedRemark], list[str]]:
     file_text = read_text(path)
     if file_text is None:
-        return False, [], []
+        return [], []
     lines = file_text.split("\n")
     blocks = list(marker_blocks(lines))
     # Without --strip, skip a file holding a conversation, as removing only its
@@ -298,7 +267,7 @@ def process(
             "use at-agent -c to continue or --strip to end the conversation",
             file=sys.stderr,
         )
-        return False, [], []
+        return [], []
 
     clean_lines = []
     remarks = []
@@ -327,11 +296,11 @@ def process(
     if remarks and not dry_run:
         write_lines(path, clean_lines)
     if not strip:
-        return True, remarks, []
+        return remarks, []
     removed = difflib.unified_diff(
         lines, clean_lines, str(path), str(path), n=1, lineterm=""
     )
-    return True, remarks, list(removed)
+    return remarks, list(removed)
 
 
 # Return the @agent remarks in paths that aren't directly followed by a @human
@@ -503,8 +472,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="relay and remove @agent annotations")
     parser.add_argument(
         "--discover",
-        choices=["inodes", "args", "rg"],
-        help="choose files from state inodes, arguments, or rg",
+        choices=["queue", "args", "rg"],
+        help="choose files from the edited file queue, arguments, or rg",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="report remarks without editing files"
@@ -531,14 +500,12 @@ def main() -> None:
     if args.write_agent_reply and not args.files:
         parser.error("--write-agent-reply requires file arguments")
 
-    paths, queue_text = discover_paths(args, parser)
+    paths = discover_paths(args, parser)
     if args.write_agent_reply:
         reply(paths, args.dry_run)
         if args.dry_run:
             return
     if args.write_agent_reply or args.chat:
-        # Leave the inode queue alone: a conversation's files stay queued until
-        # --strip ends it, so that --strip can still find them.
         pending = pending_remarks(paths)
         if not pending:
             print(
@@ -551,16 +518,10 @@ def main() -> None:
 
     remarks = []
     removed = []
-    processed_paths = []
     for path in paths:
-        processed, path_remarks, path_removed = process(path, args.dry_run, args.strip)
+        path_remarks, path_removed = process(path, args.dry_run, args.strip)
         remarks.extend(path_remarks)
         removed.extend(path_removed)
-        if processed:
-            processed_paths.append(path)
-
-    if queue_text is not None and not args.dry_run:
-        consume_inode_queue(queue_text, processed_paths)
 
     if not remarks:
         print("No @agent remarks found.")
