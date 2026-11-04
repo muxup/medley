@@ -110,45 +110,47 @@ def state_dir() -> Path:
     return directory
 
 
-# Read the editor-written queue of edited files, a "DIR_INODE NAME" line for
-# each, returning the queued names keyed by directory inode. Unlike paths, these
-# are the same inside and outside a sandbox, and unlike a file's inode, they
-# survive a tool renaming a new file over it.
-def read_edited_file_queue() -> dict[int, set[str]]:
-    path = state_dir() / "edited_file_queue"
+# Return the entries in the editor-written queue of edited files. This is a directory
+# holding an empty DIR_INODE_NAME file for each, creating it when needed. The
+# use of a directory inode alongside the file name allows files to match
+# inside a sandbox that might have the file accessible via a different path
+# name. Using the directory inode rather than the file inode means we survive
+# a tool overwriting the file when editing it.
+def read_edited_file_queue() -> set[str]:
+    queue = state_dir() / "edited_file_queue"
     try:
-        lines = path.read_text().splitlines()
-    except FileNotFoundError:
-        print(f"warning: edited file queue not found: {path}", file=sys.stderr)
-        return {}
-    except (OSError, ValueError) as e:
-        print(f"warning: could not read edited file queue {path}: {e}", file=sys.stderr)
-        return {}
-    queued: dict[int, set[str]] = {}
-    for line in lines:
-        dir_inode, _, name = line.partition(" ")
-        if dir_inode.isdecimal() and name:
-            queued.setdefault(int(dir_inode), set()).add(name)
-        else:
-            print(
-                f"warning: ignoring malformed line in {path}: {line!r}", file=sys.stderr
-            )
-    return queued
+        queue.mkdir(exist_ok=True)
+        return set(os.listdir(queue))
+    except OSError as e:
+        print(f"warning: could not read edited file queue: {e}", file=sys.stderr)
+        return set()
 
 
 # Return the paths of the queued files within the current directory tree.
-def queued_paths(queued: dict[int, set[str]]) -> list[Path]:
+def queued_paths(queued: set[str]) -> list[Path]:
     paths = []
-    for directory, _, _ in Path.cwd().walk():
+    for directory, _, names in Path.cwd().walk():
         try:
             dir_inode = directory.stat().st_ino
         except OSError:
             continue
-        for name in queued.get(dir_inode, ()):
-            path = directory / name
-            if path.is_file() and not path.is_symlink():
-                paths.append(path)
+        for name in names:
+            if f"{dir_inode}_{name}" in queued:
+                path = directory / name
+                if path.is_file(follow_symlinks=False):
+                    paths.append(path)
     return paths
+
+
+# Remove the given files from the edited file queue.
+def remove_from_queue(paths: set[Path]) -> None:
+    queue = state_dir() / "edited_file_queue"
+    for path in paths:
+        entry = queue / f"{path.parent.stat().st_ino}_{path.name}"
+        try:
+            entry.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"warning: could not update edited file queue: {e}", file=sys.stderr)
 
 
 # Find candidate files by scanning the current tree with ripgrep.
@@ -522,6 +524,8 @@ def main() -> None:
         path_remarks, path_removed = process(path, args.dry_run, args.strip)
         remarks.extend(path_remarks)
         removed.extend(path_removed)
+    if not args.dry_run:
+        remove_from_queue({remark.file for remark in remarks})
 
     if not remarks:
         print("No @agent remarks found.")
