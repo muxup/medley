@@ -142,10 +142,24 @@ def queued_paths(queued: set[str]) -> list[Path]:
     return paths
 
 
-# Remove the given files from the edited file queue.
-def remove_from_queue(paths: set[Path]) -> None:
+# Whether path has any @agent or @human remarks, or None if it is unreadable.
+# A binary file has none, as at-agent ignores binary files.
+def has_remarks(path: Path) -> bool | None:
+    try:
+        file_text = read_text(path)
+    except OSError:
+        return None
+    return file_text is not None and any(marker_blocks(file_text.split("\n")))
+
+
+# Remove the given files from the edited file queue, unless they still have
+# remarks, such as an ongoing conversation.
+def remove_from_queue(paths: list[Path]) -> None:
     queue = state_dir() / "edited_file_queue"
     for path in paths:
+        # Keep files that still have remarks, or that we couldn't read.
+        if has_remarks(path) is not False:
+            continue
         entry = queue / f"{path.parent.stat().st_ino}_{path.name}"
         try:
             entry.unlink(missing_ok=True)
@@ -230,14 +244,19 @@ def discover_paths(
     parser.error(f"unknown discovery mode: {mode}")
 
 
-# Return the text of path, or None if it is unreadable or binary (heuristically,
-# having a NUL byte near the start). Line endings are left untranslated, so CRLF
-# lines keep their \r.
+# Return the text of path, or None if it is binary (heuristically, having a NUL
+# byte near the start). Raises OSError if path is unreadable. Line endings are
+# left untranslated, so CRLF lines keep their \r.
 def read_text(path: Path) -> str | None:
+    with path.open(encoding="utf-8", errors="surrogateescape", newline="") as f:
+        text = f.read(8192)
+        return None if "\0" in text else text + f.read()
+
+
+# As read_text, but warning and returning None if path is unreadable.
+def try_read_text_or_warn(path: Path) -> str | None:
     try:
-        with path.open(encoding="utf-8", errors="surrogateescape", newline="") as f:
-            text = f.read(8192)
-            return None if "\0" in text else text + f.read()
+        return read_text(path)
     except OSError as e:
         print(f"warning: could not read {path}: {e}", file=sys.stderr)
         return None
@@ -256,7 +275,7 @@ def write_lines(path: Path, lines: list[str]) -> None:
 def process(
     path: Path, dry_run: bool, strip: bool
 ) -> tuple[list[RemovedRemark], list[str]]:
-    file_text = read_text(path)
+    file_text = try_read_text_or_warn(path)
     if file_text is None:
         return [], []
     lines = file_text.split("\n")
@@ -313,7 +332,7 @@ def pending_remarks(paths: list[Path]) -> list[PendingRemark]:
         # Show paths in the current tree relative to it, for readability.
         if path.is_relative_to(Path.cwd()):
             path = path.relative_to(Path.cwd())
-        file_text = read_text(path)
+        file_text = try_read_text_or_warn(path)
         if file_text is None:
             continue
         lines = file_text.removesuffix("\n").split("\n")
@@ -416,7 +435,7 @@ def reply(paths: list[Path], dry_run: bool) -> None:
     for remark, text in reversed(matched):
         path, end = remark.file, remark.end
         if path not in files:
-            file_text = read_text(path)
+            file_text = try_read_text_or_warn(path)
             if file_text is None:
                 sys.exit(f"error: could not read {path}; no replies were inserted.")
             files[path] = file_text.split("\n")
@@ -507,6 +526,8 @@ def main() -> None:
         reply(paths, args.dry_run)
         if args.dry_run:
             return
+    if args.chat and not args.dry_run:
+        remove_from_queue(paths)
     if args.write_agent_reply or args.chat:
         pending = pending_remarks(paths)
         if not pending:
@@ -525,7 +546,7 @@ def main() -> None:
         remarks.extend(path_remarks)
         removed.extend(path_removed)
     if not args.dry_run:
-        remove_from_queue({remark.file for remark in remarks})
+        remove_from_queue(paths)
 
     if not remarks:
         print("No @agent remarks found.")
