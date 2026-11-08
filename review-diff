@@ -4,9 +4,10 @@
 # Distributed under the terms of the MIT-0 license, see LICENSE for details.
 # SPDX-License-Identifier: MIT-0
 
-# `gen` writes a diff showing the whole of each changed file. Editing its context
-# and '+' lines edits the file, and `apply` writes the edited files to the
-# worktree, after checking they haven't changed since the diff was generated.
+# `gen` writes a diff showing the whole of each changed file, to review.diff by
+# default. Editing its context and '+' lines edits the file, and `apply` writes
+# the edited files to the worktree, after checking they haven't changed since
+# the diff was generated.
 
 import argparse
 import os
@@ -44,6 +45,8 @@ DIFF_ARGS = [
 # Leave every generated diff with a trailer to identify we created it and make
 # it easy to reject diffs not created by this tool.
 TRAILER = b"# review-diff\n"
+# The diff gen writes and apply reads, unless told otherwise.
+DEFAULT_FILE = "review.diff"
 
 AGENT_HELP = """\
 The file is a Git diff in which each changed file is one hunk covering the
@@ -56,8 +59,8 @@ whole file. To change a file, edit its hunk:
 - Don't update hunk headers or line counts. Leave the header lines and the
   final "# review-diff" line as they are.
 
-Check your edits with "review-diff apply --check FILE", but leave
-"review-diff apply" to the user."""
+Check your edits with "review-diff apply --check", adding the diff's path if
+it isn't review.diff, but leave "review-diff apply" to the user."""
 
 
 # One file's part of the diff: its path, its hunk's context and '+' lines, and
@@ -79,9 +82,12 @@ def run_git(args, ok=(0,)):
 
 
 # Write a full-context diff of BASE -> HEAD (or HEAD -> index with --staged) to
-# stdout, limited to args.paths if any. BASE... means the merge base, as with
-# git diff.
+# args.output, or stdout if it's -, limited to args.paths if any. BASE... means
+# the merge base, as with git diff.
 def do_gen(args):
+    to_file = args.output != "-"
+    if to_file and Path(args.output).exists() and not args.force:
+        sys.exit(f"{args.output}: already exists; use -f to overwrite it")
     if run_git(["diff", "--name-only", "--no-relative", "--"] + args.paths):
         sys.exit("files in the diff have unstaged changes; commit, stage or stash them")
     if args.staged:
@@ -94,7 +100,11 @@ def do_gen(args):
     out = run_git(cmd + ["--"] + args.paths)
     if not out:
         sys.exit("no changes to diff")
-    sys.stdout.buffer.write(out + TRAILER)
+    if to_file:
+        Path(args.output).write_bytes(out + TRAILER)
+        print(f"review-diff: wrote {args.output}")
+    else:
+        sys.stdout.buffer.write(out + TRAILER)
 
 
 # Parse the (possibly edited) diff into a FileDiff for each file with a hunk,
@@ -227,8 +237,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     gen = sub.add_parser(
         "gen",
-        usage="review-diff gen (BASE | --staged) [-- PATH...]",
-        help="write a full-context diff to stdout",
+        usage="review-diff gen (BASE | --staged) [-o FILE] [-f] [-- PATH...]",
+        help=f"write a full-context diff to {DEFAULT_FILE}",
     )
     gen.set_defaults(func=do_gen)
     what = gen.add_mutually_exclusive_group(required=True)
@@ -238,9 +248,24 @@ def main():
     what.add_argument(
         "--staged", action="store_true", help="diff staged changes (HEAD -> index)"
     )
+    gen.add_argument(
+        "-o",
+        "--output",
+        default=DEFAULT_FILE,
+        metavar="FILE",
+        help=f"write the diff to FILE (default: {DEFAULT_FILE}), or stdout if -",
+    )
+    gen.add_argument(
+        "-f", "--force", action="store_true", help="overwrite FILE if it exists"
+    )
     apply_ = sub.add_parser("apply", help="apply edits made to a diff from gen")
     apply_.set_defaults(func=do_apply)
-    apply_.add_argument("file", help="the edited diff")
+    apply_.add_argument(
+        "file",
+        nargs="?",
+        default=DEFAULT_FILE,
+        help=f"the edited diff (default: {DEFAULT_FILE})",
+    )
     apply_.add_argument(
         "--check",
         action="store_true",
