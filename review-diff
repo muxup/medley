@@ -7,7 +7,8 @@
 # `gen` writes a diff showing the whole of each changed file, to review.diff by
 # default. Editing its context and '+' lines edits the file, and `apply` writes
 # the edited files to the worktree, after checking they haven't changed since
-# the diff was generated.
+# the diff was generated. `apply -f` writes over the worktree's current
+# contents instead, so the same diff can be edited and applied again.
 
 import argparse
 import os
@@ -60,7 +61,9 @@ whole file. To change a file, edit its hunk:
   final "# review-diff" line as they are.
 
 Check your edits with "review-diff apply --check", adding the diff's path if
-it isn't review.diff, but leave "review-diff apply" to the user."""
+it isn't review.diff, and -f if the diff has already been applied. --check only
+prints the result; leave applying the edits to the user, unless told
+otherwise."""
 
 
 # One file's part of the diff: its path, its hunk's context and '+' lines, and
@@ -164,15 +167,21 @@ def edited_contents(file_diff, before):
     return after
 
 
-# Exit unless path is in the repository and unchanged since gen in both the
-# index and the worktree.
-def require_unchanged(path, new_id, before):
+# Exit unless path is in the repository.
+def require_in_repo(path):
     if path.startswith("/") or ".." in path.split("/"):
         sys.exit(f"{path}: refusing path outside the repository")
+
+
+# Exit unless path is unchanged since gen in both the index and the worktree.
+def require_unchanged(path, new_id, before):
     staged = run_git(["rev-parse", f":{path}"]).decode().strip()
     worktree = Path(path)
     if staged != new_id or not worktree.is_file() or worktree.read_bytes() != before:
-        sys.exit(f"{path}: changed since the diff was generated; regenerate it")
+        sys.exit(
+            f"{path}: changed since the diff was generated; "
+            f"regenerate the diff, or use -f to overwrite the file"
+        )
 
 
 # Return git's diff from old to new as a list of hunk lines, or [] if they match.
@@ -199,7 +208,8 @@ def format_edit(path, before, after):
 
 
 # Write the edited files to the worktree, leaving the index alone, or with
-# --check print the edits as a diff.
+# --check print the edits as a diff. Files must be unchanged since gen, unless
+# -f is given, in which case edits are relative to their current contents.
 def do_apply(args):
     file_diffs = read_diff(args.file)
     # Diff paths are relative to the top of the repository.
@@ -207,20 +217,33 @@ def do_apply(args):
     # Check every edit before writing any.
     edits = []
     for file_diff in file_diffs:
+        require_in_repo(file_diff.path)
+        worktree = Path(file_diff.path)
         # Symlinks have no text to edit.
-        if Path(file_diff.path).is_symlink():
+        if worktree.is_symlink():
             continue
         before = run_git(["cat-file", "blob", file_diff.new_id])
         after = edited_contents(file_diff, before)
-        if after != before:
+        if not args.force:
+            base = before
+        elif worktree.is_file():
+            base = worktree.read_bytes()
+        elif not worktree.exists():
+            # Recreate files deleted from the worktree.
+            base = b""
+        else:
+            sys.exit(f"{file_diff.path}: not a regular file")
+        if after == base:
+            continue
+        if not args.force:
             require_unchanged(file_diff.path, file_diff.new_id, before)
-            edits.append((file_diff.path, before, after))
+        edits.append((file_diff.path, base, after))
     if not edits:
         print("review-diff: no edits to apply")
         return
-    for path, before, after in edits:
+    for path, base, after in edits:
         if args.check:
-            sys.stdout.buffer.write(format_edit(path, before, after))
+            sys.stdout.buffer.write(format_edit(path, base, after))
         else:
             Path(path).write_bytes(after)
             print(f"review-diff: applied edits to {path}")
@@ -270,6 +293,12 @@ def main():
         "--check",
         action="store_true",
         help="validate and print the edits as a diff without applying them",
+    )
+    apply_.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="apply even if files changed since gen, overwriting their contents",
     )
     agent_help = sub.add_parser(
         "agent-help", help="explain how to edit the diff, for agents"
