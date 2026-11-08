@@ -9,10 +9,10 @@
 # worktree, after checking they haven't changed since the diff was generated.
 
 import argparse
-import difflib
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,7 +33,6 @@ DIFF_CFG = [
     "core.quotePath=false",
 ]
 DIFF_ARGS = [
-    f"-U{LINES_OF_CONTEXT}",
     "--full-index",
     "--no-color",
     "--no-ext-diff",
@@ -70,10 +69,11 @@ class FileDiff:
     lines: list[bytes] = field(default_factory=list)
 
 
-# Run a git command and return its output, exiting with its error on failure.
-def run_git(args):
+# Run a git command and return its output, exiting with its error if its exit
+# status isn't in ok.
+def run_git(args, ok=(0,)):
     result = subprocess.run(["git"] + args, capture_output=True)
-    if result.returncode:
+    if result.returncode not in ok:
         sys.exit(f"git failed: {result.stderr.decode(errors='replace').strip()}")
     return result.stdout
 
@@ -90,7 +90,8 @@ def do_gen(args):
         endpoints = [args.base + "HEAD"]
     else:
         endpoints = [args.base, "HEAD"]
-    out = run_git(DIFF_CFG + ["diff"] + DIFF_ARGS + endpoints + ["--"] + args.paths)
+    cmd = DIFF_CFG + ["diff", f"-U{LINES_OF_CONTEXT}"] + DIFF_ARGS + endpoints
+    out = run_git(cmd + ["--"] + args.paths)
     if not out:
         sys.exit("no changes to diff")
     sys.stdout.buffer.write(out + TRAILER)
@@ -164,17 +165,27 @@ def require_unchanged(path, new_id, before):
         sys.exit(f"{path}: changed since the diff was generated; regenerate it")
 
 
+# Return git's diff from old to new as a list of hunk lines, or [] if they match.
+def git_diff(old, new, context=LINES_OF_CONTEXT):
+    with tempfile.TemporaryDirectory() as tmp:
+        old_path, new_path = f"{tmp}/old", f"{tmp}/new"
+        Path(old_path).write_bytes(old)
+        Path(new_path).write_bytes(new)
+        cmd = DIFF_CFG + ["diff", "--no-index", f"-U{context}"] + DIFF_ARGS
+        # git diff --no-index exits with 1 if the files differ.
+        out = run_git(cmd + [old_path, new_path], ok=(0, 1))
+    if not out:
+        return []
+    # Drop the header, which names the temporary files.
+    hunks = out[out.index(b"\n@@") + 1 :]
+    return hunks.removesuffix(b"\n").split(b"\n")
+
+
 # Return a unified diff of an edit to path.
 def format_edit(path, before, after):
-    diff = difflib.diff_bytes(
-        difflib.unified_diff,
-        before.removesuffix(b"\n").split(b"\n"),
-        after.removesuffix(b"\n").split(b"\n"),
-        b"a/" + path.encode(),
-        b"b/" + path.encode(),
-        lineterm=b"",
-    )
-    return b"".join(line + b"\n" for line in diff)
+    lines = [b"--- a/" + path.encode(), b"+++ b/" + path.encode()]
+    lines += git_diff(before, after, context=3)
+    return b"\n".join(lines) + b"\n"
 
 
 # Write the edited files to the worktree, leaving the index alone, or with
